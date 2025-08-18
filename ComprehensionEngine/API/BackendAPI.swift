@@ -2,31 +2,40 @@ import Foundation
 
 class BackendAPI {
     private let baseURLString: String
+    private let authHeaderName: String?
+    private let authHeaderValue: String?
 
     init() {
-        // Prefer Info.plist value, then environment. Trim whitespace to avoid false negatives.
-        let plistURLRaw = Bundle.main.object(forInfoDictionaryKey: "BACKEND_BASE_URL") as? String
-        let plistURL = plistURLRaw?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let envURLRaw = ProcessInfo.processInfo.environment["BACKEND_BASE_URL"]
-        let envURL = envURLRaw?.trimmingCharacters(in: .whitespacesAndNewlines)
-        
-        if let plistURL, !plistURL.isEmpty {
-            self.baseURLString = plistURL
-        } else if let envURL, !envURL.isEmpty {
-            self.baseURLString = envURL
+        self.baseURLString = BackendAPI.resolveBaseURLString() ?? ""
+        // Resolve optional auth headers (prefer Info.plist, then environment)
+        let plistApiKeyRaw = Bundle.main.object(forInfoDictionaryKey: "BACKEND_API_KEY") as? String
+        let envApiKeyRaw = ProcessInfo.processInfo.environment["BACKEND_API_KEY"]
+        let apiKey = (plistApiKeyRaw ?? envApiKeyRaw)?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let plistBearerRaw = Bundle.main.object(forInfoDictionaryKey: "BACKEND_BEARER_TOKEN") as? String
+        let envBearerRaw = ProcessInfo.processInfo.environment["BACKEND_BEARER_TOKEN"]
+        let bearerToken = (plistBearerRaw ?? envBearerRaw)?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if let apiKey, !apiKey.isEmpty {
+            self.authHeaderName = "x-api-key"
+            self.authHeaderValue = apiKey
+        } else if let bearerToken, !bearerToken.isEmpty {
+            self.authHeaderName = "Authorization"
+            self.authHeaderValue = "Bearer \(bearerToken)"
         } else {
-            #if DEBUG
-            #if targetEnvironment(simulator)
-            self.baseURLString = "http://127.0.0.1:8000"
-            #else
-            // On physical devices, require explicit LAN IP/host in Info.plist or env
-            self.baseURLString = ""
-            #endif
-            #else
-            self.baseURLString = ""
-            #endif
+            self.authHeaderName = nil
+            self.authHeaderValue = nil
         }
+
+        let authSummary: String
+        if authHeaderName == "x-api-key" { authSummary = "x-api-key: <set>" }
+        else if authHeaderName == "Authorization" { authSummary = "Authorization: Bearer <set>" }
+        else { authSummary = "<none>" }
+
+        let plistURLRaw = Bundle.main.object(forInfoDictionaryKey: "BACKEND_BASE_URL") as? String
+        let envURLRaw = ProcessInfo.processInfo.environment["BACKEND_BASE_URL"]
         print("🔍 DEBUG: BackendAPI resolved URLs — plist=\(plistURLRaw ?? "<nil>") env=\(envURLRaw ?? "<nil>") → using=\(self.baseURLString)")
+        print("🔍 DEBUG: BackendAPI auth headers — \(authSummary)")
     }
 
     func sendMessage(message: String, history: [ChatMessage]) async throws -> ChatResponse {
@@ -71,22 +80,10 @@ class BackendAPI {
         urlRequest.httpMethod = "POST"
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
         urlRequest.setValue("audio/mpeg", forHTTPHeaderField: "Accept")
+        applyAuthHeader(&urlRequest)
         urlRequest.httpBody = jsonData
 
-        let config = URLSessionConfiguration.default
-        config.waitsForConnectivity = true
-        config.timeoutIntervalForRequest = 20
-        config.timeoutIntervalForResource = 60
-        let session = URLSession(configuration: config)
-
-        let (data, response) = try await session.data(for: urlRequest)
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw APIError.invalidResponse
-        }
-        guard (200...299).contains(httpResponse.statusCode) else {
-            let errorMessage = String(data: data, encoding: .utf8) ?? "Unknown error"
-            throw APIError.httpError(httpResponse.statusCode, errorMessage)
-        }
+        let data = try await performWithAuthRetry(request: urlRequest)
         return data
     }
 
@@ -118,25 +115,64 @@ class BackendAPI {
         var urlRequest = URLRequest(url: url)
         urlRequest.httpMethod = "POST"
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        applyAuthHeader(&urlRequest)
         urlRequest.httpBody = body
 
-        let config = URLSessionConfiguration.default
-        config.waitsForConnectivity = true
-        config.timeoutIntervalForRequest = 20
-        config.timeoutIntervalForResource = 30
+        let data = try await performWithAuthRetry(request: urlRequest)
+        return data
+    }
 
-        let session = URLSession(configuration: config)
-        let (data, response) = try await session.data(for: urlRequest)
+    // MARK: - Auth
+    private func applyAuthHeader(_ request: inout URLRequest) {
+        // Prefer AuthManager tokens persisted in Keychain
+        if let token: String = KeychainHelper.shared.read(key: "ce.access_token"), !token.isEmpty {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            return
+        }
+        if let name = authHeaderName, let value = authHeaderValue {
+            request.setValue(value, forHTTPHeaderField: name)
+        }
+    }
 
+    private func performWithAuthRetry(request: URLRequest) async throws -> Data {
+        let (data, response) = try await execute(request: request)
         guard let httpResponse = response as? HTTPURLResponse else {
             throw APIError.invalidResponse
         }
-
+        if httpResponse.statusCode == 401 {
+            let refreshed: Bool = await AuthManager.shared.forceRefresh()
+            if refreshed {
+                var retried = request
+                // Clear any stale header and apply new token
+                retried.setValue(nil, forHTTPHeaderField: "Authorization")
+                applyAuthHeader(&retried)
+                let (retryData, retryResponse) = try await execute(request: retried)
+                guard let retryHttp = retryResponse as? HTTPURLResponse else { throw APIError.invalidResponse }
+                guard (200...299).contains(retryHttp.statusCode) else {
+                    let message = String(data: retryData, encoding: .utf8) ?? "Unknown error"
+                    throw APIError.httpError(retryHttp.statusCode, message)
+                }
+                return retryData
+            } else {
+                // Propagate 401 as is
+                let message = String(data: data, encoding: .utf8) ?? "Unauthorized"
+                throw APIError.httpError(401, message)
+            }
+        }
         guard (200...299).contains(httpResponse.statusCode) else {
-            let errorMessage = String(data: data, encoding: .utf8) ?? "Unknown error"
-            throw APIError.httpError(httpResponse.statusCode, errorMessage)
+            let message = String(data: data, encoding: .utf8) ?? "Unknown error"
+            throw APIError.httpError(httpResponse.statusCode, message)
         }
         return data
+    }
+
+    private func execute(request: URLRequest) async throws -> (Data, URLResponse) {
+        let config = URLSessionConfiguration.default
+        config.waitsForConnectivity = true
+        config.timeoutIntervalForRequest = 20
+        config.timeoutIntervalForResource = 60
+        let session = URLSession(configuration: config)
+        return try await session.data(for: request)
     }
 }
 
@@ -175,6 +211,31 @@ extension BackendAPI {
             case .parsingError(let details):
                 return "Failed to parse response: \(details)"
             }
+        }
+    }
+}
+
+// MARK: - Shared URL Resolution
+extension BackendAPI {
+    static func resolveBaseURLString() -> String? {
+        let plistURLRaw = Bundle.main.object(forInfoDictionaryKey: "BACKEND_BASE_URL") as? String
+        let plistURL = plistURLRaw?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let envURLRaw = ProcessInfo.processInfo.environment["BACKEND_BASE_URL"]
+        let envURL = envURLRaw?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let plistURL, !plistURL.isEmpty {
+            return plistURL
+        } else if let envURL, !envURL.isEmpty {
+            return envURL
+        } else {
+            #if DEBUG
+            #if targetEnvironment(simulator)
+            return "http://127.0.0.1:8000"
+            #else
+            return nil
+            #endif
+            #else
+            return nil
+            #endif
         }
     }
 }

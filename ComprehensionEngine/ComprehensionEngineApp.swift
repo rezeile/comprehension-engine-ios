@@ -4,9 +4,10 @@ import SwiftUI
 struct ComprehensionEngineApp: App {
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            RootView()
                 .environmentObject(AudioManager.shared)
                 .environmentObject(ChatManager.shared)
+                .environmentObject(AuthManager.shared)
                 .onAppear {
                     print("🔍 DEBUG: App launched successfully")
                 }

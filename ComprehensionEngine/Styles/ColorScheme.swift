@@ -58,6 +58,34 @@ struct AppColors {
     // MARK: - Overlay Colors
     static let overlay = Color.black.opacity(0.4)
     static let overlayLight = Color.black.opacity(0.2)
+
+    // MARK: - Brand / Marketing
+    static var brandGradientStops: [Color] {
+        [
+            Color(hex: "7C3AED"), // violet
+            Color(hex: "EC4899"), // pink
+            Color(hex: "22D3EE"), // cyan
+            Color(hex: "F59E0B")  // amber
+        ]
+    }
+
+    static func brandLinearGradient() -> LinearGradient {
+        LinearGradient(
+            gradient: Gradient(colors: AppColors.brandGradientStops),
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
+        )
+    }
+
+    static func brandAngularGradient() -> AngularGradient {
+        AngularGradient(
+            gradient: Gradient(colors: AppColors.brandGradientStops),
+            center: .center
+        )
+    }
+
+    static let brandGlow = Color.white.opacity(0.25)
+    static let focusRing = Color(hex: "60A5FA") // light blue focus ring
 }
 
 // MARK: - Color Extensions

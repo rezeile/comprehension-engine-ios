@@ -18,12 +18,10 @@
 	<string>APPL</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
-
 	<key>UILaunchStoryboardName</key>
 	<string>LaunchScreen</string>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
-
 	<key>UISupportedInterfaceOrientations~iphone</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
@@ -37,19 +35,29 @@
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
-
 	<key>NSMicrophoneUsageDescription</key>
 	<string>This app uses the microphone to record your voice for transcription and voice chat.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>This app uses speech recognition to transcribe your voice into text for chat.</string>
-
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>
 		<true/>
 	</dict>
-
 	<key>BACKEND_BASE_URL</key>
-	<string>https://comprehension-engine-production.up.railway.app</string>
+	<string>https://containers-trinidad-organic-rod.trycloudflare.com</string>
+	<key>REQUIRE_LOGIN</key>
+	<true/>
+	<key>GIDClientID</key>
+	<string>2560171895-4o477ak8kemae4febn7q9fvn3uqh2lac.apps.googleusercontent.com</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>com.googleusercontent.apps.2560171895-4o477ak8kemae4febn7q9fvn3uqh2lac</string>
+			</array>
+		</dict>
+	</array>
 </dict>
 </plist>

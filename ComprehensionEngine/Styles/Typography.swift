@@ -183,6 +183,16 @@ extension View {
         ))
     }
     
+    // Color-enabled variant (ensures inner color wins over outer environment)
+    func displayHero(color: Color) -> some View {
+        modifier(TypographyModifier(
+            font: .displayHero(),
+            lineHeight: AppTypography.LineHeight.tight,
+            letterSpacing: AppTypography.LetterSpacing.tight,
+            color: color
+        ))
+    }
+    
     func displayLarge() -> some View {
         modifier(TypographyModifier(
             font: .displayLarge(),
@@ -224,6 +234,15 @@ extension View {
         ))
     }
     
+    func heading2(color: Color) -> some View {
+        modifier(TypographyModifier(
+            font: .heading2(),
+            lineHeight: AppTypography.LineHeight.tight,
+            letterSpacing: AppTypography.LetterSpacing.normal,
+            color: color
+        ))
+    }
+    
     func heading3() -> some View {
         modifier(TypographyModifier(
             font: .heading3(),
@@ -246,6 +265,33 @@ extension View {
             font: .bodyLarge(),
             lineHeight: AppTypography.LineHeight.relaxed,
             letterSpacing: AppTypography.LetterSpacing.normal
+        ))
+    }
+    
+    func bodyLarge(color: Color) -> some View {
+        modifier(TypographyModifier(
+            font: .bodyLarge(),
+            lineHeight: AppTypography.LineHeight.relaxed,
+            letterSpacing: AppTypography.LetterSpacing.normal,
+            color: color
+        ))
+    }
+
+    // ~50% larger than bodyLarge (16pt -> 24pt)
+    func bodyXLarge() -> some View {
+        modifier(TypographyModifier(
+            font: .text(AppTypography.Size.xxxl, weight: .regular),
+            lineHeight: AppTypography.LineHeight.relaxed,
+            letterSpacing: AppTypography.LetterSpacing.normal
+        ))
+    }
+    
+    func bodyXLarge(color: Color) -> some View {
+        modifier(TypographyModifier(
+            font: .text(AppTypography.Size.xxxl, weight: .regular),
+            lineHeight: AppTypography.LineHeight.relaxed,
+            letterSpacing: AppTypography.LetterSpacing.normal,
+            color: color
         ))
     }
     

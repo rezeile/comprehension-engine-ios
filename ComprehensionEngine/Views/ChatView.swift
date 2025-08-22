@@ -8,6 +8,7 @@ struct ChatView: View {
     @State private var showingVoiceMode = false
     @State private var showingSettings = false
     @State private var showingNewChatAlert = false
+    @State private var inputContainerHeight: CGFloat = 0
     
     var body: some View {
         NavigationStack {
@@ -24,10 +25,16 @@ struct ChatView: View {
                             if chatManager.isLoading {
                                 LoadingViews.TypingIndicator()
                             }
+
+                            // Bottom anchor to guarantee a valid target for scroll
+                            Color.clear
+                                .frame(height: 1)
+                                .id("bottom-anchor")
                         }
                         .padding(.horizontal, AppSpacing.Layout.screenMarginSmall)
                         .padding(.top, AppSpacing.SafeArea.top + AppSpacing.md)
-                        .padding(.bottom, AppSpacing.md)
+                        // Reserve space at bottom equal to the input's height so last message isn't obscured
+                        .padding(.bottom, inputContainerHeight + AppSpacing.md)
                     }
                     .scrollDismissesKeyboard(.immediately)
                     .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
@@ -39,7 +46,20 @@ struct ChatView: View {
                         UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
                     }
                     .onChange(of: chatManager.messages.count) { _ in
+                        // Defer slightly so layout completes before scrolling
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                            scrollToBottom(proxy: proxy)
+                        }
+                    }
+                    // Also scroll when input height changes significantly (layout shift)
+                    .onChange(of: inputContainerHeight) { _ in
                         scrollToBottom(proxy: proxy)
+                    }
+                    // When switching sessions from history, ensure we scroll once layout stabilizes
+                    .onChange(of: chatManager.currentSession.id) { _ in
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                            scrollToBottom(proxy: proxy)
+                        }
                     }
                 }
             }
@@ -74,6 +94,10 @@ struct ChatView: View {
                 onSend: sendTextMessage,
                 onVoiceMode: { showingVoiceMode = true }
             )
+            // Capture input container height from preference
+            .onPreferenceChange(InputContainerHeightPreferenceKey.self) { h in
+                inputContainerHeight = h
+            }
         }
         .overlay {
             if showingVoiceMode {
@@ -122,10 +146,8 @@ struct ChatView: View {
     }
     
     private func scrollToBottom(proxy: ScrollViewProxy) {
-        if let lastMessage = chatManager.messages.last {
-            withAnimation(.easeInOut(duration: 0.3)) {
-                proxy.scrollTo(lastMessage.id, anchor: .bottom)
-            }
+        withAnimation(.easeInOut(duration: 0.3)) {
+            proxy.scrollTo("bottom-anchor", anchor: .bottom)
         }
     }
 }

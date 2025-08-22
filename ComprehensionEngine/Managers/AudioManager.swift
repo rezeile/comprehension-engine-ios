@@ -10,6 +10,7 @@ class AudioManager: NSObject, ObservableObject {
     @Published var isRecording = false
     @Published var isSpeaking = false
     @Published var transcriptionText = ""
+    @Published var hasTranscript: Bool = false
     @Published var inputLevel: Float = 0 // 0.0 - 1.0 normalized mic level for UI visualizations
     @Published var microphonePermission: AVAudioSession.RecordPermission = .undetermined
     @Published var speechRecognitionPermission: SFSpeechRecognizerAuthorizationStatus = .notDetermined
@@ -25,6 +26,7 @@ class AudioManager: NSObject, ObservableObject {
     
     private var audioPlayer: AVAudioPlayer?
     private var cancellables = Set<AnyCancellable>()
+    private var transcriptionBuffer: String = ""
     
     // MARK: - Initialization
     private override init() {
@@ -90,6 +92,7 @@ class AudioManager: NSObject, ObservableObject {
         
         // Reset state
         transcriptionText = ""
+        // Do not clear transcriptionBuffer here; it is cleared when finalized
         isRecording = true
         
         // Ensure any ongoing playback is stopped before reconfiguring the session
@@ -154,6 +157,8 @@ class AudioManager: NSObject, ObservableObject {
             if let result = result {
                 DispatchQueue.main.async {
                     self.transcriptionText = result.bestTranscription.formattedString
+                    self.transcriptionBuffer = result.bestTranscription.formattedString
+                    self.hasTranscript = !self.transcriptionBuffer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 }
             }
             
@@ -174,6 +179,18 @@ class AudioManager: NSObject, ObservableObject {
         audioEngine.stop()
         audioEngine.inputNode.removeTap(onBus: 0)
         recognitionRequest?.endAudio()
+    }
+
+    // MARK: - Transcription Buffer Control
+    /// Returns the finalized transcript and clears the internal buffer
+    func finalizeTranscription() -> String {
+        let finalized = transcriptionBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
+        transcriptionBuffer = ""
+        DispatchQueue.main.async {
+            self.transcriptionText = ""
+            self.hasTranscript = false
+        }
+        return finalized
     }
     
     // MARK: - Speech Synthesis
@@ -229,6 +246,13 @@ class AudioManager: NSObject, ObservableObject {
             }
         }
     }
+
+    /// Await until speaking finishes (works for system TTS)
+    func waitUntilSpeakingFinished() async {
+        while isSpeaking || synthesizer.isSpeaking || (audioPlayer?.isPlaying == true) {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+    }
     
     // MARK: - Audio Playback
     @MainActor
@@ -253,6 +277,20 @@ class AudioManager: NSObject, ObservableObject {
         // Wait for completion
         while audioPlayer?.isPlaying == true {
             try await Task.sleep(nanoseconds: 100_000_000) // 0.1 seconds
+        }
+    }
+    
+    // MARK: - Speaking Control
+    /// Immediately stops any ongoing speech synthesis or audio playback
+    func stopSpeaking() {
+        if synthesizer.isSpeaking {
+            synthesizer.stopSpeaking(at: .immediate)
+        }
+        if audioPlayer?.isPlaying == true {
+            audioPlayer?.stop()
+        }
+        DispatchQueue.main.async { [weak self] in
+            self?.isSpeaking = false
         }
     }
     

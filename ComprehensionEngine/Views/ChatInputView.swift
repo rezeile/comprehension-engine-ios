@@ -156,6 +156,12 @@ struct ChatInputView: View {
             .background(AppColors.background)
             .shadow(AppSpacing.Shadow.small)
         }
+        // Report the total container height upwards so parent can pad ScrollView bottom
+        .background(
+            GeometryReader { geo in
+                Color.clear.preference(key: InputContainerHeightPreferenceKey.self, value: geo.size.height)
+            }
+        )
     }
 
     private func sendIfPossible() {
@@ -187,6 +193,14 @@ private struct ControlsRowSizePreferenceKey: PreferenceKey {
     static func reduce(value: inout CGSize, nextValue: () -> CGSize) {
         let next = nextValue()
         value = CGSize(width: max(value.width, next.width), height: max(value.height, next.height))
+    }
+}
+
+// Expose total ChatInputView container height to ancestors
+struct InputContainerHeightPreferenceKey: PreferenceKey {
+    static var defaultValue: CGFloat = 60
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
     }
 }
 

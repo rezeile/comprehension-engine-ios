@@ -87,6 +87,43 @@ class BackendAPI {
         return data
     }
 
+    // MARK: - Conversations (Backend-backed history)
+    func listConversations(limit: Int = 20, offset: Int = 0) async throws -> [ConversationSummaryDTO] {
+        guard let url = buildURL(path: "/api/conversations?limit=\(limit)&offset=\(offset)") else {
+            throw APIError.missingBaseURL
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        applyAuthHeader(&request)
+
+        let data = try await performWithAuthRetry(request: request)
+        do {
+            return try JSONDecoder().decode([ConversationSummaryDTO].self, from: data)
+        } catch {
+            throw APIError.parsingError("Failed to decode conversations: \(error.localizedDescription)")
+        }
+    }
+
+    func listConversationTurns(conversationId: String, limit: Int = 1, offset: Int = 0) async throws -> [ConversationTurnDTO] {
+        guard let url = buildURL(path: "/api/conversations/\(conversationId)/turns?limit=\(limit)&offset=\(offset)") else {
+            throw APIError.missingBaseURL
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        applyAuthHeader(&request)
+
+        let data = try await performWithAuthRetry(request: request)
+        do {
+            return try JSONDecoder().decode([ConversationTurnDTO].self, from: data)
+        } catch {
+            throw APIError.parsingError("Failed to decode conversation turns: \(error.localizedDescription)")
+        }
+    }
+
     private func buildURL(path: String) -> URL? {
         guard !baseURLString.isEmpty else { return nil }
         var trimmed = baseURLString
@@ -238,6 +275,28 @@ extension BackendAPI {
             #endif
         }
     }
+}
+
+// MARK: - DTOs for backend conversation APIs
+struct ConversationSummaryDTO: Codable {
+    let id: String?
+    let title: String?
+    let topic: String?
+    let created_at: String?
+    let updated_at: String?
+    let is_active: Bool?
+    let last_turn_at: String?
+    let turn_count: Int?
+}
+
+struct ConversationTurnDTO: Codable {
+    let id: String?
+    let turn_number: Int?
+    let user_input: String
+    let ai_response: String
+    let timestamp: String?
+    let comprehension_score: Int?
+    let comprehension_notes: String?
 }
 
 

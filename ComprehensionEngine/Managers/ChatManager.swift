@@ -19,7 +19,10 @@ class ChatManager: ObservableObject {
     // MARK: - Initialization
     private init() {
         print("🔍 DEBUG: ChatManager init started")
-        loadSessions()
+        // Prefer backend sessions; fall back to local if unavailable
+        Task { [weak self] in
+            await self?.refreshSessionsFromBackend()
+        }
         print("🔍 DEBUG: ChatManager init completed")
     }
     
@@ -105,6 +108,13 @@ class ChatManager: ObservableObject {
     func loadSession(_ session: ChatSession) {
         currentSession = session
         messages = session.messages
+
+        // If this session originated from the backend, fetch full history
+        if let remoteId = session.remoteId, !remoteId.isEmpty {
+            Task { [weak self] in
+                await self?.loadFullSessionFromBackend(remoteId: remoteId)
+            }
+        }
     }
     
     func deleteSession(_ session: ChatSession) {
@@ -123,15 +133,95 @@ class ChatManager: ObservableObject {
     
     // MARK: - Private Methods
     private func loadSessions() {
+        // Legacy local persistence (kept as fallback only)
         if let data = UserDefaults.standard.data(forKey: "chat_sessions"),
            let decodedSessions = try? JSONDecoder().decode([ChatSession].self, from: data) {
             sessions = decodedSessions
         }
     }
-    
+
     private func saveSessions() {
+        // Keep local persistence for backward compatibility only
         if let encoded = try? JSONEncoder().encode(sessions) {
             UserDefaults.standard.set(encoded, forKey: "chat_sessions")
+        }
+    }
+
+    // MARK: - Backend Sessions
+    private func iso8601ToDate(_ s: String?) -> Date? {
+        guard let s else { return nil }
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = f.date(from: s) { return d }
+        // Try without fractional seconds
+        let f2 = ISO8601DateFormatter()
+        f2.formatOptions = [.withInternetDateTime]
+        return f2.date(from: s)
+    }
+
+    @MainActor
+    private func refreshSessionsFromBackend() async {
+        do {
+            // If backend not configured, fall back to local
+            if chatAPI.baseURLStringIsEmpty {
+                loadSessions()
+                return
+            }
+
+            // Fetch conversation summaries
+            let summaries = try await chatAPI.listConversations(limit: 20, offset: 0)
+
+            var builtSessions: [ChatSession] = []
+            builtSessions.reserveCapacity(summaries.count)
+
+            for summary in summaries {
+                // Create a display session; note: ChatSession.id is client-generated
+                var session = ChatSession(title: (summary.title?.isEmpty == false ? summary.title! : "New Chat"))
+                session.remoteId = summary.id
+                if let updated = iso8601ToDate(summary.updated_at) { session.updatedAt = updated }
+
+                // Build preview by fetching the last turn only when available
+                if let turnCount = summary.turn_count, turnCount > 0, let convoId = summary.id {
+                    let offset = max(0, turnCount - 1)
+                    do {
+                        let lastTurns = try await chatAPI.listConversationTurns(conversationId: convoId, limit: 1, offset: offset)
+                        if let t = lastTurns.first {
+                            // Append last user + assistant messages for preview
+                            session.messages.append(ChatMessage(content: t.user_input, role: .user, isFromUser: true))
+                            session.messages.append(ChatMessage(content: t.ai_response, role: .assistant, isFromUser: false))
+                        }
+                    } catch {
+                        // Non-fatal; continue without preview
+                    }
+                }
+
+                builtSessions.append(session)
+            }
+
+            // Sort by updatedAt desc to match server ordering
+            builtSessions.sort { $0.updatedAt > $1.updatedAt }
+            self.sessions = builtSessions
+        } catch {
+            // Fallback to local storage if backend fails
+            loadSessions()
+        }
+    }
+
+    @MainActor
+    private func loadFullSessionFromBackend(remoteId: String) async {
+        do {
+            // Fetch up to 500 turns in order; paginate later if needed
+            let turns = try await chatAPI.listConversationTurns(conversationId: remoteId, limit: 500, offset: 0)
+            var rebuilt: [ChatMessage] = []
+            rebuilt.reserveCapacity(turns.count * 2)
+            for t in turns {
+                rebuilt.append(ChatMessage(content: t.user_input, role: .user, isFromUser: true))
+                rebuilt.append(ChatMessage(content: t.ai_response, role: .assistant, isFromUser: false))
+            }
+            self.currentSession.messages = rebuilt
+            self.messages = rebuilt
+        } catch {
+            // Non-fatal: keep whatever we had (preview or empty)
         }
     }
 }

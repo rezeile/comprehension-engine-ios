@@ -43,6 +43,7 @@ struct ChatResponse: Codable {
 
 struct ChatSession: Identifiable, Codable {
     let id: UUID
+    var remoteId: String?
     let title: String
     var messages: [ChatMessage]
     let createdAt: Date
@@ -50,6 +51,7 @@ struct ChatSession: Identifiable, Codable {
     
     init(title: String = "New Chat") {
         self.id = UUID()
+        self.remoteId = nil
         self.title = title
         self.messages = []
         self.createdAt = Date()

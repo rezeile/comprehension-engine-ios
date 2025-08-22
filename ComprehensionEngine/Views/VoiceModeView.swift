@@ -9,6 +9,7 @@ struct VoiceModeView: View {
     @State private var showingError = false
     @State private var errorMessage = ""
     @AppStorage("feature_waveform_enabled") private var featureWaveformEnabled: Bool = true
+    @AppStorage("voice_auto_resume_after_reply") private var voiceAutoResumeAfterReply: Bool = true
     
     var body: some View {
         NavigationStack {
@@ -32,28 +33,27 @@ struct VoiceModeView: View {
                     )
                 }
                 
-                // Transcription display
-                TranscriptionDisplay(
-                    text: voiceModeState.transcriptionText,
-                    isSpeaking: voiceModeState.isSpeaking
-                )
-                
                 Spacer()
                 
-                // Voice controls
-                VoiceModeControls(
-                    onStartRecording: startVoiceInput,
-                    onStopRecording: stopVoiceInput,
+                // Primary single control (arrow to send, square to stop speaking)
+                PrimaryVoiceButton(
                     onSendMessage: sendVoiceMessage,
-                    isRecording: voiceModeState.isRecording,
+                    onStopSpeaking: { audioManager.stopSpeaking() },
                     isSpeaking: voiceModeState.isSpeaking,
-                    isLoading: chatManager.isLoading
+                    isLoading: chatManager.isLoading,
+                    sendEnabled: audioManager.hasTranscript
                 )
                 
                 Spacer()
             }
             .padding()
             .background(Color(.systemBackground))
+            .contentShape(Rectangle())
+            .onTapGesture {
+                if voiceModeState.isSpeaking {
+                    audioManager.stopSpeaking()
+                }
+            }
             .navigationBarTitleDisplayMode(.inline)
             .toolbarBackground(
                 LinearGradient(
@@ -76,14 +76,19 @@ struct VoiceModeView: View {
         } message: {
             Text(errorMessage)
         }
-        .onReceive(audioManager.$transcriptionText) { text in
-            voiceModeState.transcriptionText = text
-        }
         .onReceive(audioManager.$isRecording) { isRecording in
             voiceModeState.isRecording = isRecording
         }
         .onReceive(audioManager.$isSpeaking) { isSpeaking in
             voiceModeState.isSpeaking = isSpeaking
+        }
+        .task {
+            // Auto-start listening on entry
+            do {
+                try audioManager.startRecording()
+            } catch {
+                showError("Failed to start recording: \(error.localizedDescription)")
+            }
         }
     }
     
@@ -100,13 +105,15 @@ struct VoiceModeView: View {
     }
     
     private func sendVoiceMessage() {
-        guard !voiceModeState.transcriptionText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            showError("No transcription to send")
+        // Pause input and finalize transcript
+        audioManager.stopRecording()
+        let message = audioManager.finalizeTranscription()
+        guard !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            showError("No speech detected")
+            // Resume listening so user can try again
+            do { try audioManager.startRecording() } catch { }
             return
         }
-        
-        let message = voiceModeState.transcriptionText
-        voiceModeState.transcriptionText = ""
         
         Task {
             do {
@@ -117,10 +124,17 @@ struct VoiceModeView: View {
                     try await audioManager.speakWithElevenLabs(response.content, voiceId: voiceModeState.selectedVoice.id)
                 } else {
                     audioManager.speakWithSystem(response.content)
+                    await audioManager.waitUntilSpeakingFinished()
                 }
                 
+                // Auto-resume recording
+                if voiceAutoResumeAfterReply {
+                    try? audioManager.startRecording()
+                }
             } catch {
                 showError("Failed to send message: \(error.localizedDescription)")
+                // Attempt to resume listening even on failure
+                try? audioManager.startRecording()
             }
         }
     }
@@ -232,43 +246,43 @@ struct TranscriptionDisplay: View {
     }
 }
 
-struct VoiceModeControls: View {
-    let onStartRecording: () -> Void
-    let onStopRecording: () -> Void
+struct PrimaryVoiceButton: View {
     let onSendMessage: () -> Void
-    let isRecording: Bool
+    let onStopSpeaking: () -> Void
     let isSpeaking: Bool
     let isLoading: Bool
+    let sendEnabled: Bool
     
     var body: some View {
-        HStack(spacing: 30) {
-            // Record button
-            Button(action: isRecording ? onStopRecording : onStartRecording) {
-                Image(systemName: isRecording ? "stop.fill" : "mic.fill")
-                    .font(.system(size: 30))
-                    .foregroundColor(.white)
+        Button(action: action) {
+            ZStack {
+                Circle()
+                    .fill(Color.black)
                     .frame(width: 80, height: 80)
-                    .background(
-                        Circle()
-                            .fill(isRecording ? .red : .blue)
-                    )
-            }
-            .disabled(isSpeaking || isLoading)
-            
-            // Send button (only show when there's transcription)
-            if !isRecording && !isLoading {
-                Button(action: onSendMessage) {
-                    Image(systemName: "arrow.up.circle.fill")
-                        .font(.system(size: 30))
-                        .foregroundColor(.blue)
-                        .frame(width: 60, height: 60)
-                        .background(
-                            Circle()
-                                .fill(Color(.systemGray6))
-                        )
+                if isLoading {
+                    ProgressView()
+                        .tint(.white)
+                } else if isSpeaking {
+                    Image(systemName: "stop.fill")
+                        .font(.system(size: 24, weight: .bold))
+                        .foregroundColor(.white)
+                } else {
+                    Image(systemName: "arrow.up")
+                        .font(.system(size: 24, weight: .bold))
+                        .foregroundColor(sendEnabled ? .white : .gray)
                 }
-                .disabled(isSpeaking)
             }
+        }
+        .disabled(isLoading || (!isSpeaking && !sendEnabled))
+        .accessibilityLabel(isSpeaking ? "Stop speaking" : "Send")
+    }
+    
+    private func action() {
+        if isLoading { return }
+        if isSpeaking {
+            onStopSpeaking()
+        } else if sendEnabled {
+            onSendMessage()
         }
     }
 }
@@ -339,7 +353,7 @@ struct VoiceWaveformView: View {
         if isRecording { return "Listening…" }
         if isSpeaking { return "Speaking…" }
         if isLoading { return "Thinking…" }
-        return level > 0.02 ? "Ready" : "Tap to speak"
+        return "Ready and listening"
     }
 }
 

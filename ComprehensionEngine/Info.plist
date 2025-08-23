@@ -45,7 +45,7 @@
 		<true/>
 	</dict>
 	<key>BACKEND_BASE_URL</key>
-	<string>https://scripting-mexico-rats-competent.trycloudflare.com</string>
+	<string>https://api.brightspring.ai</string>
 	<key>REQUIRE_LOGIN</key>
 	<true/>
 	<key>GIDClientID</key>

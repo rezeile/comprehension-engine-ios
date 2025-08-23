@@ -28,6 +28,15 @@ class AudioManager: NSObject, ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     private var transcriptionBuffer: String = ""
     
+    // MARK: - Streaming Playback (voice_chat)
+    private let streamingQueue = DispatchQueue(label: "ce.audio.streaming.queue")
+    private var streamingEngine: AVAudioEngine?
+    private var streamingPlayer: AVAudioPlayerNode?
+    private var streamingFormat: AVAudioFormat = AVAudioFormat(standardFormatWithSampleRate: 16000, channels: 1)!
+    private var streamingTask: URLSessionDataTask?
+    private var pcmResidual: Data = Data()
+    private var lastAppendAt: CFAbsoluteTime = CFAbsoluteTimeGetCurrent()
+    
     // MARK: - Initialization
     private override init() {
         super.init()
@@ -205,13 +214,26 @@ class AudioManager: NSObject, ObservableObject {
             if !BackendAPI().baseURLStringIsEmpty {
                 // Try backend first
                 do {
+                    let _ttsStart = Date().timeIntervalSince1970
+                    print("⏱️ LATENCY [voice] tts_request_start: source=backend ts=\(_ttsStart)")
                     audioData = try await backendAPI.textToSpeech(text: text, voiceId: voiceId)
+                    let _ttsEnd = Date().timeIntervalSince1970
+                    print("⏱️ LATENCY [voice] tts_request_end: source=backend ts=\(_ttsEnd) delta=\(_ttsEnd - _ttsStart)s size=\(audioData.count)B")
                 } catch {
                     // Fallback to direct ElevenLabs
+                    print("⏱️ LATENCY [voice] tts_backend_failed_fallback: \(error.localizedDescription)")
+                    let _ttsStart = Date().timeIntervalSince1970
+                    print("⏱️ LATENCY [voice] tts_request_start: source=direct_elevenlabs ts=\(_ttsStart)")
                     audioData = try await elevenLabsAPI.generateSpeech(text: text, voiceId: voiceId)
+                    let _ttsEnd = Date().timeIntervalSince1970
+                    print("⏱️ LATENCY [voice] tts_request_end: source=direct_elevenlabs ts=\(_ttsEnd) delta=\(_ttsEnd - _ttsStart)s size=\(audioData.count)B")
                 }
             } else {
+                let _ttsStart = Date().timeIntervalSince1970
+                print("⏱️ LATENCY [voice] tts_request_start: source=direct_elevenlabs ts=\(_ttsStart)")
                 audioData = try await elevenLabsAPI.generateSpeech(text: text, voiceId: voiceId)
+                let _ttsEnd = Date().timeIntervalSince1970
+                print("⏱️ LATENCY [voice] tts_request_end: source=direct_elevenlabs ts=\(_ttsEnd) delta=\(_ttsEnd - _ttsStart)s size=\(audioData.count)B")
             }
             try await playAudioData(audioData)
             await MainActor.run { self.isSpeaking = false }
@@ -272,11 +294,170 @@ class AudioManager: NSObject, ObservableObject {
         // Ensure the player is ready and volume is audible
         audioPlayer?.prepareToPlay()
         audioPlayer?.volume = 1.0
+        // ⏱️ LATENCY: eleven labs first starts speaking (at play start)
+        print("⏱️ LATENCY [voice] tts_play_start: \(Date().timeIntervalSince1970)")
         audioPlayer?.play()
         
         // Wait for completion
         while audioPlayer?.isPlaying == true {
             try await Task.sleep(nanoseconds: 100_000_000) // 0.1 seconds
+        }
+    }
+    
+    // MARK: - Streaming voice_chat
+    /// Start streaming voice chat audio from backend and play via AVAudioEngine + AVAudioPlayerNode
+    func startStreamingVoiceChat(message: String, voiceId: String, conversationId: String?) {
+        // Stop any existing speaking/streams first
+        cancelStreamingPlayback()
+        if isRecording {
+            stopRecording()
+        }
+        
+        // Switch to playback session
+        do { try configureAudioSession(for: .playback) } catch { }
+        
+        // Lazily set up engine/player
+        setupStreamingEngineIfNeeded()
+        guard let engine = streamingEngine, let player = streamingPlayer else { return }
+        
+        // Reset residuals
+        pcmResidual.removeAll(keepingCapacity: true)
+        lastAppendAt = CFAbsoluteTimeGetCurrent()
+        
+        // Kick off HTTP streaming
+        do {
+            let task = try backendAPI.startVoiceChatStream(
+                message: message,
+                voiceId: voiceId,
+                conversationId: conversationId,
+                acceptMimeType: "audio/pcm",
+                onFirstByte: { [weak self] in
+                    guard let self = self else { return }
+                    DispatchQueue.main.async {
+                        self.isSpeaking = true
+                        if !engine.isRunning {
+                            do { try engine.start() } catch { }
+                        }
+                        if !player.isPlaying {
+                            player.play()
+                        }
+                        print("⏱️ LATENCY [voice] voice_chat_first_byte: \(Date().timeIntervalSince1970)")
+                    }
+                },
+                onBytes: { [weak self] chunk in
+                    guard let self = self else { return }
+                    self.streamingQueue.async {
+                        self.feedPCMData(chunk)
+                    }
+                },
+                onComplete: { [weak self] in
+                    guard let self = self else { return }
+                    self.streamingQueue.async {
+                        self.flushResidualIfAny()
+                        self.scheduleStopIfQuiescent(delay: 0.4)
+                    }
+                },
+                onError: { [weak self] error in
+                    print("voice_chat stream error: \(error.localizedDescription)")
+                    self?.cancelStreamingPlayback()
+                }
+            )
+            streamingTask = task
+        } catch {
+            print("Failed to start voice_chat stream: \(error)")
+        }
+    }
+    
+    /// Cancel the in-flight voice_chat stream and stop playback immediately
+    func cancelStreamingPlayback() {
+        streamingTask?.cancel()
+        streamingTask = nil
+        streamingQueue.sync {
+            pcmResidual.removeAll(keepingCapacity: false)
+        }
+        if let player = streamingPlayer {
+            if player.isPlaying { player.stop() }
+        }
+        if let engine = streamingEngine {
+            if engine.isRunning { engine.stop() }
+        }
+        DispatchQueue.main.async { [weak self] in
+            self?.isSpeaking = false
+        }
+    }
+    
+    // MARK: - Streaming internals
+    private func setupStreamingEngineIfNeeded() {
+        if streamingEngine == nil {
+            streamingEngine = AVAudioEngine()
+        }
+        if streamingPlayer == nil {
+            streamingPlayer = AVAudioPlayerNode()
+        }
+        guard let engine = streamingEngine, let player = streamingPlayer else { return }
+        if player.engine == nil {
+            engine.attach(player)
+            engine.connect(player, to: engine.mainMixerNode, format: streamingFormat)
+            do { try engine.start() } catch { }
+        }
+    }
+    
+    private func feedPCMData(_ data: Data) {
+        // Ensure even number of bytes (16-bit samples)
+        var combined = Data()
+        combined.reserveCapacity(pcmResidual.count + data.count)
+        if !pcmResidual.isEmpty { combined.append(pcmResidual) }
+        combined.append(data)
+        let totalBytes = combined.count
+        let usableBytes = (totalBytes / 2) * 2
+        let leftover = totalBytes - usableBytes
+        if leftover > 0 {
+            pcmResidual = combined.suffix(leftover)
+        } else {
+            pcmResidual.removeAll(keepingCapacity: true)
+        }
+        guard usableBytes > 0 else { return }
+        let pcmChunk = combined.prefix(usableBytes)
+        
+        // Convert 16-bit little-endian PCM to float32 [-1, 1]
+        let sampleCount = usableBytes / 2
+        let frames = AVAudioFrameCount(sampleCount)
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: streamingFormat, frameCapacity: frames) else { return }
+        buffer.frameLength = frames
+        guard let channel = buffer.floatChannelData?.pointee else { return }
+        pcmChunk.withUnsafeBytes { rawPtr in
+            let int16Ptr = rawPtr.bindMemory(to: Int16.self)
+            for i in 0..<sampleCount {
+                let s = Int16(littleEndian: int16Ptr[i])
+                channel[i] = max(-1.0, min(1.0, Float(s) / 32768.0))
+            }
+        }
+        
+        streamingPlayer?.scheduleBuffer(buffer, completionHandler: nil)
+        lastAppendAt = CFAbsoluteTimeGetCurrent()
+    }
+    
+    private func flushResidualIfAny() {
+        if !pcmResidual.isEmpty {
+            feedPCMData(Data()) // forces flush logic; will no-op if residual < 2 bytes
+        }
+    }
+    
+    private func scheduleStopIfQuiescent(delay: TimeInterval) {
+        let deadline = DispatchTime.now() + delay
+        streamingQueue.asyncAfter(deadline: deadline) { [weak self] in
+            guard let self = self else { return }
+            let now = CFAbsoluteTimeGetCurrent()
+            if now - self.lastAppendAt >= delay {
+                DispatchQueue.main.async {
+                    if let player = self.streamingPlayer, player.isPlaying { player.stop() }
+                    if let engine = self.streamingEngine, engine.isRunning { engine.stop() }
+                    self.isSpeaking = false
+                }
+            } else {
+                // Data arrived after scheduling; check again shortly
+                self.scheduleStopIfQuiescent(delay: delay)
+            }
         }
     }
     

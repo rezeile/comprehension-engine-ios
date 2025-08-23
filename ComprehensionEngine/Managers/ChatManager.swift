@@ -30,6 +30,9 @@ class ChatManager: ObservableObject {
     func sendMessage(_ content: String) async throws -> ChatMessage {
         // DEBUG BREAKPOINT 1: Method entry
         print("🔍 DEBUG: sendMessage called with content: \(content)")
+        // ⏱️ LATENCY: sending message to Claude/backend
+        let _latencyClaudeSendTs = Date().timeIntervalSince1970
+        print("⏱️ LATENCY [voice] claude_send_initiated: \(_latencyClaudeSendTs)")
         
         guard !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             print("🔍 DEBUG: Empty message detected")
@@ -55,12 +58,17 @@ class ChatManager: ObservableObject {
         let conversationHistory = await MainActor.run {
             return self.currentSession.messages
         }
-        print("🔍 DEBUG: Conversation history count: \(conversationHistory.count)")
+        // Avoid sending the just-appended user message twice (both as `message` and in history)
+        let historyExcludingPending = Array(conversationHistory.dropLast())
+        print("🔍 DEBUG: Conversation history count total=\(conversationHistory.count) sending=\(historyExcludingPending.count)")
         
         do {
             print("🔍 DEBUG: About to call Backend API")
-            let response = try await chatAPI.sendMessage(message: content, history: conversationHistory)
+            let response = try await chatAPI.sendMessage(message: content, history: historyExcludingPending)
             print("🔍 DEBUG: API response received: \(response.content)")
+            // ⏱️ LATENCY: message received from Claude/backend
+            let _latencyClaudeRecvTs = Date().timeIntervalSince1970
+            print("⏱️ LATENCY [voice] claude_response_received: \(_latencyClaudeRecvTs) delta=\(_latencyClaudeRecvTs - _latencyClaudeSendTs)s")
             
             // Create assistant message
             let assistantMessage = ChatMessage(content: response.content, role: .assistant, isFromUser: false)

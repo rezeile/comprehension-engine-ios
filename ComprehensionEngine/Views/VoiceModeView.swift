@@ -105,6 +105,8 @@ struct VoiceModeView: View {
     }
     
     private func sendVoiceMessage() {
+        // ⏱️ LATENCY: user tapped send to submit STT transcript
+        print("⏱️ LATENCY [voice] user_tapped_send: \(Date().timeIntervalSince1970)")
         // Pause input and finalize transcript
         audioManager.stopRecording()
         let message = audioManager.finalizeTranscription()

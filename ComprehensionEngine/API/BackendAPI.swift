@@ -1,4 +1,5 @@
 import Foundation
+import ObjectiveC
 
 class BackendAPI {
     private let baseURLString: String
@@ -51,13 +52,21 @@ class BackendAPI {
         let jsonData = try JSONEncoder().encode(requestBody)
 
         do {
+            let _httpStart = Date().timeIntervalSince1970
+            print("⏱️ LATENCY [voice] claude_http_request_start: \(_httpStart) url=\(endpointURL.absoluteString)")
             let data = try await performPOST(url: endpointURL, body: jsonData)
+            let _httpEnd = Date().timeIntervalSince1970
+            print("⏱️ LATENCY [voice] claude_http_request_end: \(_httpEnd) delta=\(_httpEnd - _httpStart)s bytes=\(data.count)")
             let backendResponse = try JSONDecoder().decode(BackendChatResponse.self, from: data)
             return ChatResponse(content: backendResponse.response, role: .assistant)
         } catch let nsError as NSError {
             if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCannotConnectToHost {
                 if let alternateURL = buildAlternateURL(path: "/api/chat") {
+                    let _httpStart = Date().timeIntervalSince1970
+                    print("⏱️ LATENCY [voice] claude_http_request_start: \(_httpStart) url=\(alternateURL.absoluteString) (alternate)")
                     let data = try await performPOST(url: alternateURL, body: jsonData)
+                    let _httpEnd = Date().timeIntervalSince1970
+                    print("⏱️ LATENCY [voice] claude_http_request_end: \(_httpEnd) delta=\(_httpEnd - _httpStart)s bytes=\(data.count) (alternate)")
                     let backendResponse = try JSONDecoder().decode(BackendChatResponse.self, from: data)
                     return ChatResponse(content: backendResponse.response, role: .assistant)
                 }
@@ -249,6 +258,122 @@ extension BackendAPI {
                 return "Failed to parse response: \(details)"
             }
         }
+    }
+}
+
+// MARK: - Voice Chat Streaming (\"/api/voice_chat\")
+extension BackendAPI {
+    private final class VoiceChatStreamDelegate: NSObject, URLSessionDataDelegate, URLSessionTaskDelegate {
+        private let onFirstByte: (() -> Void)?
+        private let onBytes: (Data) -> Void
+        private let onComplete: () -> Void
+        private let onError: (Error) -> Void
+        private var didEmitFirstByte = false
+
+        init(
+            onFirstByte: (() -> Void)?,
+            onBytes: @escaping (Data) -> Void,
+            onComplete: @escaping () -> Void,
+            onError: @escaping (Error) -> Void
+        ) {
+            self.onFirstByte = onFirstByte
+            self.onBytes = onBytes
+            self.onComplete = onComplete
+            self.onError = onError
+        }
+
+        // Validate initial HTTP response status
+        func urlSession(
+            _ session: URLSession,
+            dataTask: URLSessionDataTask,
+            didReceive response: URLResponse,
+            completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+        ) {
+            if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+                let body = "HTTP \(http.statusCode)"
+                onError(BackendAPI.APIError.httpError(http.statusCode, body))
+                completionHandler(.cancel)
+            } else {
+                completionHandler(.allow)
+            }
+        }
+
+        // Stream incoming bytes
+        func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+            if !didEmitFirstByte {
+                didEmitFirstByte = true
+                onFirstByte?()
+            }
+            onBytes(data)
+        }
+
+        // Completion / error
+        func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+            if let error = error {
+                onError(error)
+            } else {
+                onComplete()
+            }
+        }
+    }
+
+    private struct VoiceChatRequest: Codable {
+        let message: String
+        let voice_id: String
+        let conversation_id: String?
+    }
+
+    /// Starts a streaming voice chat request to the backend and delivers audio bytes incrementally.
+    /// - Returns: The underlying URLSessionDataTask; retain it to allow cancellation.
+    @discardableResult
+    func startVoiceChatStream(
+        message: String,
+        voiceId: String,
+        conversationId: String? = nil,
+        acceptMimeType: String = "audio/pcm, audio/mpeg;q=0.9",
+        onFirstByte: (() -> Void)? = nil,
+        onBytes: @escaping (Data) -> Void,
+        onComplete: @escaping () -> Void,
+        onError: @escaping (Error) -> Void
+    ) throws -> URLSessionDataTask {
+        guard let endpointURL = buildURL(path: "/api/voice_chat") else {
+            throw APIError.missingBaseURL
+        }
+
+        let body = VoiceChatRequest(message: message, voice_id: voiceId, conversation_id: conversationId)
+        let jsonData = try JSONEncoder().encode(body)
+
+        var request = URLRequest(url: endpointURL)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(acceptMimeType, forHTTPHeaderField: "Accept")
+        request.setValue(UUID().uuidString, forHTTPHeaderField: "x-correlation-id")
+        applyAuthHeader(&request)
+        request.httpBody = jsonData
+
+        let delegate = VoiceChatStreamDelegate(
+            onFirstByte: onFirstByte,
+            onBytes: onBytes,
+            onComplete: onComplete,
+            onError: onError
+        )
+
+        let config = URLSessionConfiguration.default
+        config.waitsForConnectivity = true
+        config.timeoutIntervalForRequest = 60
+        config.timeoutIntervalForResource = 600 // allow long streaming
+        let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
+
+        let task = session.dataTask(with: request)
+
+        // Associate session & delegate with task to retain them for the stream lifetime
+        objc_setAssociatedObject(task, UnsafeRawPointer(bitPattern: 0xBEEF001)!, session, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+        objc_setAssociatedObject(task, UnsafeRawPointer(bitPattern: 0xBEEF002)!, delegate, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+
+        let startTs = Date().timeIntervalSince1970
+        print("⏱️ LATENCY [voice] voice_chat_http_start: \(startTs) url=\(endpointURL.absoluteString)")
+        task.resume()
+        return task
     }
 }
 

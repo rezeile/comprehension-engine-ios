@@ -6,11 +6,19 @@ struct RootView: View {
 
     var body: some View {
         Group {
-            if !requireLoginEnabled() || auth.isAuthenticated {
-                ContentView()
-                    .transition(rootTransition)
+            if requireLoginEnabled() {
+                if !auth.hasRestoredSession {
+                    AuthProcessingView()
+                        .transition(rootTransition)
+                } else if auth.isAuthenticated {
+                    ContentView()
+                        .transition(rootTransition)
+                } else {
+                    LoginView()
+                        .transition(rootTransition)
+                }
             } else {
-                LoginView()
+                ContentView()
                     .transition(rootTransition)
             }
         }

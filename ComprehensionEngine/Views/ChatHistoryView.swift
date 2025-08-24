@@ -56,6 +56,9 @@ struct ChatHistoryView: View {
                 }
             }
             .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Search chats")
+            .refreshable {
+                await chatManager.refreshSessions()
+            }
             .navigationTitle("Chat History")
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
@@ -65,21 +68,71 @@ struct ChatHistoryView: View {
                     }
                 }
             }
+            .task {
+                await chatManager.refreshSessions()
+            }
         }
     }
     
     private var filteredSessions: [ChatSession] {
-        guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return chatManager.sessions.reversed() }
-        let lower = query.lowercased()
-        return chatManager.sessions.filter { session in
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            return chatManager.sessions.sorted { $0.updatedAt > $1.updatedAt }
+        }
+        let lower = trimmed.lowercased()
+        let filtered = chatManager.sessions.filter { session in
             if session.title.lowercased().contains(lower) { return true }
             return session.messages.contains { $0.content.lowercased().contains(lower) }
-        }.reversed()
+        }
+        return filtered.sorted { $0.updatedAt > $1.updatedAt }
     }
     
     private func previewText(for session: ChatSession) -> String {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            guard let last = session.messages.last else { return "No messages yet" }
+            return (last.isFromUser ? "You: " : "Claude: ") + last.content
+        }
+
+        let lower = trimmed.lowercased()
+        if let matched = session.messages.last(where: { $0.content.lowercased().contains(lower) }) {
+            let snippet = snippet(from: matched.content, matching: lower, maxLength: 120)
+            return (matched.isFromUser ? "You: " : "Claude: ") + snippet
+        }
+
+        // If only the title matched, or no message match was found, fall back to last message
         guard let last = session.messages.last else { return "No messages yet" }
         return (last.isFromUser ? "You: " : "Claude: ") + last.content
+    }
+
+    private func snippet(from text: String, matching needleLowercased: String, maxLength: Int) -> String {
+        if maxLength <= 0 { return "" }
+        guard let range = text.range(of: needleLowercased, options: .caseInsensitive) else {
+            if text.count > maxLength { return String(text.prefix(maxLength)) + "…" }
+            return text
+        }
+
+        let matchStart = range.lowerBound
+        let matchEnd = range.upperBound
+        let matchLength = text.distance(from: matchStart, to: matchEnd)
+        let availableContext = max(0, maxLength - matchLength)
+        let contextEachSide = availableContext / 2
+
+        let distanceToStart = text.distance(from: text.startIndex, to: matchStart)
+        let distanceToEnd = text.distance(from: matchEnd, to: text.endIndex)
+
+        let takeBefore = min(contextEachSide, distanceToStart)
+        let takeAfter = min(contextEachSide, distanceToEnd)
+
+        let startIndex = text.index(matchStart, offsetBy: -takeBefore)
+        let endIndex = text.index(matchEnd, offsetBy: takeAfter)
+
+        var snippet = String(text[startIndex..<endIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if takeBefore < distanceToStart { snippet = "…" + snippet }
+        if takeAfter < distanceToEnd { snippet += "…" }
+
+        return snippet
     }
     
     private func dateText(for session: ChatSession) -> String {

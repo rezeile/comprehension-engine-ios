@@ -39,7 +39,7 @@ class BackendAPI {
         print("🔍 DEBUG: BackendAPI auth headers — \(authSummary)")
     }
 
-    func sendMessage(message: String, history: [ChatMessage]) async throws -> ChatResponse {
+    func sendMessage(message: String, history: [ChatMessage], conversationId: String? = nil, mode: String = "text") async throws -> ChatResponse {
         guard let endpointURL = buildURL(path: "/api/chat") else {
             throw APIError.missingBaseURL
         }
@@ -48,7 +48,13 @@ class BackendAPI {
             BackendMsg(role: msg.role.rawValue, content: msg.content)
         }
 
-        let requestBody = BackendChatRequest(message: message, conversation_history: backendHistory)
+        let requestBody = BackendChatRequest(
+            message: message,
+            conversation_history: backendHistory,
+            conversation_id: conversationId,
+            start_new: (conversationId == nil),
+            mode: mode
+        )
         let jsonData = try JSONEncoder().encode(requestBody)
 
         do {
@@ -58,7 +64,7 @@ class BackendAPI {
             let _httpEnd = Date().timeIntervalSince1970
             print("⏱️ LATENCY [voice] claude_http_request_end: \(_httpEnd) delta=\(_httpEnd - _httpStart)s bytes=\(data.count)")
             let backendResponse = try JSONDecoder().decode(BackendChatResponse.self, from: data)
-            return ChatResponse(content: backendResponse.response, role: .assistant)
+            return ChatResponse(content: backendResponse.response, role: .assistant, conversationId: backendResponse.conversation_id)
         } catch let nsError as NSError {
             if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCannotConnectToHost {
                 if let alternateURL = buildAlternateURL(path: "/api/chat") {
@@ -68,7 +74,7 @@ class BackendAPI {
                     let _httpEnd = Date().timeIntervalSince1970
                     print("⏱️ LATENCY [voice] claude_http_request_end: \(_httpEnd) delta=\(_httpEnd - _httpStart)s bytes=\(data.count) (alternate)")
                     let backendResponse = try JSONDecoder().decode(BackendChatResponse.self, from: data)
-                    return ChatResponse(content: backendResponse.response, role: .assistant)
+                    return ChatResponse(content: backendResponse.response, role: .assistant, conversationId: backendResponse.conversation_id)
                 }
             }
             throw nsError
@@ -226,6 +232,9 @@ class BackendAPI {
 private struct BackendChatRequest: Codable {
     let message: String
     let conversation_history: [BackendMsg]
+    let conversation_id: String?
+    let start_new: Bool?
+    let mode: String?
 }
 
 private struct BackendMsg: Codable {

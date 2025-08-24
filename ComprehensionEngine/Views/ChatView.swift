@@ -9,6 +9,7 @@ struct ChatView: View {
     @State private var showingSettings = false
     @State private var showingNewChatAlert = false
     @State private var inputContainerHeight: CGFloat = 0
+    @State private var pendingScrollToBottom = false
     
     var body: some View {
         NavigationStack {
@@ -17,7 +18,7 @@ struct ChatView: View {
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(spacing: 12) {
-                            ForEach(chatManager.messages) { message in
+                            ForEach(chatManager.visibleMessages) { message in
                                 ModernChatMessageView(message: message)
                                     .id(message.id)
                             }
@@ -45,10 +46,13 @@ struct ChatView: View {
                     .keyboardDismissal {
                         UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
                     }
-                    .onChange(of: chatManager.messages.count) { _ in
-                        // Defer slightly so layout completes before scrolling
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                            scrollToBottom(proxy: proxy)
+                    // Avoid auto-scrolling on every message count change to prevent update loops
+                    .onChange(of: chatManager.isLoading) { isLoading in
+                        // Scroll to bottom when a response finishes loading
+                        if !isLoading {
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                                scrollToBottom(proxy: proxy)
+                            }
                         }
                     }
                     // Also scroll when input height changes significantly (layout shift)
@@ -57,8 +61,20 @@ struct ChatView: View {
                     }
                     // When switching sessions from history, ensure we scroll once layout stabilizes
                     .onChange(of: chatManager.currentSession.id) { _ in
+                        // Mark that we should scroll after the new session's messages are laid out
+                        pendingScrollToBottom = true
+                        // Also try an early scroll after a short delay in case layout is already ready
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                             scrollToBottom(proxy: proxy)
+                        }
+                    }
+                    // After session switch, scroll once the visible messages actually update
+                    .onChange(of: chatManager.visibleMessages.count) { _ in
+                        if pendingScrollToBottom {
+                            DispatchQueue.main.async {
+                                scrollToBottom(proxy: proxy)
+                                pendingScrollToBottom = false
+                            }
                         }
                     }
                 }

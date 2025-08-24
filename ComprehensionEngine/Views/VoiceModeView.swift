@@ -1,4 +1,5 @@
 import SwiftUI
+import os
 
 struct VoiceModeView: View {
     @EnvironmentObject var audioManager: AudioManager
@@ -10,6 +11,12 @@ struct VoiceModeView: View {
     @State private var errorMessage = ""
     @AppStorage("feature_waveform_enabled") private var featureWaveformEnabled: Bool = true
     @AppStorage("voice_auto_resume_after_reply") private var voiceAutoResumeAfterReply: Bool = true
+    @State private var isSending: Bool = false
+    
+    // MARK: - Signposting
+    private let signposter = OSSignposter(logger: Logger(subsystem: "com.brightspring.ComprehensionEngine", category: "VoiceMode"))
+    @State private var viewSignpost: (id: OSSignpostID, state: OSSignpostIntervalState)? = nil
+    @State private var sendSignpost: (id: OSSignpostID, state: OSSignpostIntervalState)? = nil
     
     var body: some View {
         NavigationStack {
@@ -18,18 +25,20 @@ struct VoiceModeView: View {
                 
                 // Voice status indicator
                 if featureWaveformEnabled {
-                    // Non-breaking additive visualization of input level
-                    VoiceWaveformView(level: audioManager.inputLevel,
+                    let waveformId = (isSending ? "sending" : (voiceModeState.isSpeaking ? "speaking" : "listening"))
+                    VoiceWaveformView(level: (isSending || voiceModeState.isSpeaking) ? 0 : audioManager.inputLevel,
                                       isRecording: voiceModeState.isRecording,
                                       isSpeaking: voiceModeState.isSpeaking,
-                                      isLoading: chatManager.isLoading)
+                                      isLoading: (isSending || chatManager.isLoading),
+                                      animateBars: !isSending && voiceModeState.isRecording)
+                        .id(waveformId)
                         .frame(height: 160)
                         .padding(.horizontal)
                 } else {
                     VoiceStatusIndicator(
                         isSpeaking: voiceModeState.isSpeaking,
                         isRecording: voiceModeState.isRecording,
-                        isLoading: chatManager.isLoading
+                        isLoading: (isSending || chatManager.isLoading)
                     )
                 }
                 
@@ -37,10 +46,16 @@ struct VoiceModeView: View {
                 
                 // Primary single control (arrow to send, square to stop speaking)
                 PrimaryVoiceButton(
-                    onSendMessage: sendVoiceMessage,
-                    onStopSpeaking: { audioManager.stopSpeaking() },
+                    onSendMessage: {
+                        startSendSignpost()
+                        sendVoiceMessage()
+                    },
+                    onStopSpeaking: {
+                        signposter.emitEvent("voice.stop_tap")
+                        audioManager.stopSpeaking()
+                    },
                     isSpeaking: voiceModeState.isSpeaking,
-                    isLoading: chatManager.isLoading,
+                    isLoading: (isSending || chatManager.isLoading),
                     sendEnabled: audioManager.hasTranscript
                 )
                 
@@ -64,8 +79,23 @@ struct VoiceModeView: View {
             .toolbarBackground(.visible, for: .navigationBar)
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    ModernIconButton(icon: "xmark", style: .secondary, size: .small) {
-                        onClose?()
+                    Button(action: { onClose?() }) {
+                        ZStack {
+                            // Circular, high-contrast tap target with subtle border and shadow
+                            Circle()
+                                .fill(Color(.systemBackground))
+                                .frame(width: 36, height: 36)
+                                .overlay(
+                                    Circle()
+                                        .stroke(Color(.systemGray3), lineWidth: 1)
+                                )
+                                .shadow(color: Color.black.opacity(0.08), radius: 6, x: 0, y: 2)
+
+                            Image(systemName: "xmark")
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundColor(Color(.label))
+                        }
+                        .contentShape(Circle())
                     }
                     .accessibilityLabel("Close")
                 }
@@ -76,15 +106,45 @@ struct VoiceModeView: View {
         } message: {
             Text(errorMessage)
         }
+        .onAppear {
+            if viewSignpost == nil {
+                let id = signposter.makeSignpostID()
+                let st = signposter.beginInterval("voice.view_visible", id: id)
+                viewSignpost = (id, st)
+                signposter.emitEvent("voice.view_appear")
+            }
+        }
+        .onDisappear {
+            if let sp = viewSignpost {
+                signposter.emitEvent("voice.view_disappear")
+                signposter.endInterval("voice.view_visible", sp.state)
+                viewSignpost = nil
+            }
+            // Persist any unsent transcript as a local user message so it shows in chat after exit
+            let draft = audioManager.finalizeTranscription()
+            if !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                Task { @MainActor in
+                    chatManager.appendLocalUserMessage(draft)
+                }
+            }
+        }
         .onReceive(audioManager.$isRecording) { isRecording in
             voiceModeState.isRecording = isRecording
+            signposter.emitEvent(isRecording ? "voice.recording_true" : "voice.recording_false")
         }
         .onReceive(audioManager.$isSpeaking) { isSpeaking in
             voiceModeState.isSpeaking = isSpeaking
+            // As soon as speaking begins, exit sending/loading state so UI shows "Speaking..."
+            if isSpeaking {
+                isSending = false
+                chatManager.isLoading = false
+            }
+            signposter.emitEvent(isSpeaking ? "voice.speaking_true" : "voice.speaking_false")
         }
         .task {
             // Auto-start listening on entry
             do {
+                signposter.emitEvent("voice.autostart_recording")
                 try audioManager.startRecording()
             } catch {
                 showError("Failed to start recording: \(error.localizedDescription)")
@@ -107,36 +167,70 @@ struct VoiceModeView: View {
     private func sendVoiceMessage() {
         // ⏱️ LATENCY: user tapped send to submit STT transcript
         print("⏱️ LATENCY [voice] user_tapped_send: \(Date().timeIntervalSince1970)")
+        signposter.emitEvent("voice.send_tap")
         // Pause input and finalize transcript
+        print("🔍 DEBUG [voice]: sendVoiceMessage -> stopRecording")
         audioManager.stopRecording()
+        // Immediately reflect UI state for waveform/status
+        voiceModeState.isRecording = false
+        isSending = true
+        chatManager.isLoading = true
         let message = audioManager.finalizeTranscription()
+        print("🔍 DEBUG [voice]: sendVoiceMessage -> finalized transcript length=\(message.count)")
         guard !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            signposter.emitEvent("voice.send_empty")
             showError("No speech detected")
             // Resume listening so user can try again
             do { try audioManager.startRecording() } catch { }
+            endSendSignpost(success: false)
             return
         }
         
         Task {
             do {
+                print("🔍 DEBUG [voice]: sendVoiceMessage -> sending to backend; autoPlay=\(voiceSettings.autoPlayResponse)")
+                signposter.emitEvent("voice.sending")
                 let response = try await chatManager.sendMessage(message)
+                print("🔍 DEBUG [voice]: sendVoiceMessage -> backend responded; content length=\(response.content.count)")
+                signposter.emitEvent("voice.sent_success")
                 
-                // Auto-play response if enabled
-                if voiceSettings.enableElevenLabs {
-                    try await audioManager.speakWithElevenLabs(response.content, voiceId: voiceModeState.selectedVoice.id)
-                } else {
-                    audioManager.speakWithSystem(response.content)
-                    await audioManager.waitUntilSpeakingFinished()
+                // Auto-play response using backend TTS (preferred)
+                if voiceSettings.autoPlayResponse {
+                    do {
+                        print("🔍 DEBUG [voice]: sendVoiceMessage -> invoking speakWithElevenLabs voiceId=\(voiceModeState.selectedVoice.id)")
+                        try await audioManager.speakWithElevenLabs(response.content, voiceId: voiceModeState.selectedVoice.id)
+                        print("🔍 DEBUG [voice]: sendVoiceMessage -> speakWithElevenLabs finished")
+                    } catch {
+                        print("🔍 DEBUG [voice]: speakWithElevenLabs error=\(error.localizedDescription). Falling back to system TTS")
+                        // Fallback to system TTS on error
+                        audioManager.speakWithSystem(response.content)
+                        await audioManager.waitUntilSpeakingFinished()
+                    }
                 }
+                signposter.emitEvent("voice.reply_spoken")
                 
                 // Auto-resume recording
                 if voiceAutoResumeAfterReply {
+                    print("🔍 DEBUG [voice]: sendVoiceMessage -> autoresume recording")
+                    signposter.emitEvent("voice.autoresume_recording")
                     try? audioManager.startRecording()
                 }
+                await MainActor.run {
+                    chatManager.isLoading = false
+                    isSending = false
+                }
+                endSendSignpost(success: true)
             } catch {
+                print("🔍 DEBUG [voice]: sendVoiceMessage error=\(error.localizedDescription)")
                 showError("Failed to send message: \(error.localizedDescription)")
                 // Attempt to resume listening even on failure
                 try? audioManager.startRecording()
+                signposter.emitEvent("voice.send_failed")
+                await MainActor.run {
+                    chatManager.isLoading = false
+                    isSending = false
+                }
+                endSendSignpost(success: false)
             }
         }
     }
@@ -144,6 +238,22 @@ struct VoiceModeView: View {
     private func showError(_ message: String) {
         errorMessage = message
         showingError = true
+        signposter.emitEvent("voice.error_shown")
+    }
+
+    private func startSendSignpost() {
+        if sendSignpost == nil {
+            let id = signposter.makeSignpostID()
+            let st = signposter.beginInterval("voice.send_cycle", id: id)
+            sendSignpost = (id, st)
+        }
+    }
+    private func endSendSignpost(success: Bool) {
+        if let sp = sendSignpost {
+            signposter.emitEvent(success ? "voice.send_cycle_success" : "voice.send_cycle_fail")
+            signposter.endInterval("voice.send_cycle", sp.state)
+            sendSignpost = nil
+        }
     }
 }
 
@@ -170,10 +280,6 @@ struct VoiceStatusIndicator: View {
                     Image(systemName: "speaker.wave.3.fill")
                         .font(.system(size: 40))
                         .foregroundColor(.white)
-                } else if isLoading {
-                    ProgressView()
-                        .scaleEffect(1.5)
-                        .tint(.white)
                 } else {
                     Image(systemName: "mic")
                         .font(.system(size: 40))
@@ -210,15 +316,10 @@ struct VoiceStatusIndicator: View {
     }
     
     private var statusText: String {
-        if isRecording {
-            return "Listening..."
-        } else if isSpeaking {
-            return "Speaking..."
-        } else if isLoading {
-            return "Thinking..."
-        } else {
-            return "Tap to speak"
-        }
+        if isRecording { return "Listening..." }
+        if isLoading { return "Thinking..." }
+        if isSpeaking { return "Speaking..." }
+        return "Listening..." 
     }
 }
 
@@ -261,10 +362,7 @@ struct PrimaryVoiceButton: View {
                 Circle()
                     .fill(Color.black)
                     .frame(width: 80, height: 80)
-                if isLoading {
-                    ProgressView()
-                        .tint(.white)
-                } else if isSpeaking {
+                if isSpeaking || isLoading {
                     Image(systemName: "stop.fill")
                         .font(.system(size: 24, weight: .bold))
                         .foregroundColor(.white)
@@ -275,7 +373,7 @@ struct PrimaryVoiceButton: View {
                 }
             }
         }
-        .disabled(isLoading || (!isSpeaking && !sendEnabled))
+        .disabled((!isSpeaking && !sendEnabled) || isLoading)
         .accessibilityLabel(isSpeaking ? "Stop speaking" : "Send")
     }
     
@@ -303,6 +401,8 @@ struct VoiceWaveformView: View {
     let isRecording: Bool
     let isSpeaking: Bool
     let isLoading: Bool
+    let animateBars: Bool
+    
     
     private let barCount = 24
     
@@ -322,7 +422,7 @@ struct VoiceWaveformView: View {
                         Capsule()
                             .fill(barColor)
                             .frame(width: 6, height: barHeight(for: index))
-                            .animation(AppAnimations.Preset.pulse.speed(1.2).delay(Double(index) * 0.02), value: level)
+                            .animation(animateBars ? AppAnimations.Preset.pulse.speed(1.2).delay(Double(index) * 0.02) : .linear(duration: 0), value: level)
                     }
                 }
                 .padding(.horizontal, 16)
@@ -338,7 +438,6 @@ struct VoiceWaveformView: View {
     private var barColor: Color {
         if isRecording { return .red }
         if isSpeaking { return AppColors.primary }
-        if isLoading { return AppColors.accent }
         return AppColors.systemGray3
     }
     
@@ -352,10 +451,12 @@ struct VoiceWaveformView: View {
     }
     
     private var statusText: String {
-        if isRecording { return "Listening…" }
-        if isSpeaking { return "Speaking…" }
-        if isLoading { return "Thinking…" }
-        return "Ready and listening"
+        if isRecording { return "Listening..." }
+        if isLoading { return "Thinking..." }
+        if isSpeaking { return "Speaking..." }
+        return "Listening..."
     }
 }
+
+// (SpeakingBackdropView removed)
 

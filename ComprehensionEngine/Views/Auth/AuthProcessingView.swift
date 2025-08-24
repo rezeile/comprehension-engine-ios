@@ -19,18 +19,12 @@ struct AuthProcessingView: View {
                         .accessibilityLabel("Signing in")
                         .accessibilityHint("Please wait")
                         .foregroundColor(.white)
+                        .progressViewStyle(.circular)
+                        .tint(.white)
                 } else {
                     RotatingDiamond()
                         .frame(width: 96, height: 96)
                         .accessibilityHidden(true)
-                        .overlay(
-                            Text("Signing in…")
-                                .bodyLarge()
-                                .foregroundColor(.white)
-                                .padding(.top, 140)
-                                .accessibilityLabel("Signing in")
-                                .accessibilityHint("Please wait"), alignment: .top
-                        )
                 }
             }
             .accessibilityElement(children: .contain)

@@ -28,9 +28,8 @@ class VoiceModeState: ObservableObject {
 }
 
 struct VoiceSettings: Codable {
-    var selectedVoiceId: String = "21m00Tcm4TlvDq8ikWAM"
+    var selectedVoiceId: String = "ErXwobaYiN019PkySvjV"
     var speechRate: Float = 1.0
-    var enableElevenLabs: Bool = true
     var enableSystemTTS: Bool = true
     var autoPlayResponse: Bool = true
     var voiceActivation: Bool = false

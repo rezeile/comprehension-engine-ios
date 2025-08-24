@@ -1,6 +1,7 @@
 import SwiftUI
 import AVFoundation
 import Speech
+import UIKit
 
 struct SettingsView: View {
     @EnvironmentObject var audioManager: AudioManager
@@ -35,9 +36,6 @@ struct SettingsView: View {
                         
                         Slider(value: $voiceSettings.speechRate, in: 0.5...2.0, step: 0.1)
                     }
-                    
-                    // ElevenLabs Toggle
-                    Toggle("Use ElevenLabs TTS", isOn: $voiceSettings.enableElevenLabs)
                     
                     // System TTS Toggle
                     Toggle("Use System TTS", isOn: $voiceSettings.enableSystemTTS)
@@ -78,12 +76,7 @@ struct SettingsView: View {
                             .foregroundColor(ProcessInfo.processInfo.environment["ANTHROPIC_API_KEY"]?.isEmpty == false ? .green : .red)
                     }
                     
-                    HStack {
-                        Text("ElevenLabs API Key")
-                        Spacer()
-                        Text(ProcessInfo.processInfo.environment["ELEVENLABS_API_KEY"]?.isEmpty == false ? "✓" : "✗")
-                            .foregroundColor(ProcessInfo.processInfo.environment["ELEVENLABS_API_KEY"]?.isEmpty == false ? .green : .red)
-                    }
+
                 }
                 
                 // App Info Section
@@ -100,6 +93,15 @@ struct SettingsView: View {
                         Spacer()
                         Text("1")
                             .foregroundColor(.secondary)
+                    }
+                }
+
+                // Account Section
+                Section("Account") {
+                    Button("Log Out", role: .destructive) {
+                        let generator = UIImpactFeedbackGenerator(style: .medium)
+                        generator.impactOccurred()
+                        AuthManager.shared.logout()
                     }
                 }
             }
@@ -122,8 +124,7 @@ struct SettingsView: View {
     }
     
     private func loadAvailableVoices() {
-        // In a real app, you would fetch this from ElevenLabs API
-        // For now, we'll use the default voices
+        // Use the default voices defined in VoiceModels
         availableVoices = Voice.defaultVoices
     }
 }

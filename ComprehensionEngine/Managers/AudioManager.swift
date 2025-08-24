@@ -2,6 +2,7 @@ import Foundation
 import AVFoundation
 import Speech
 import Combine
+import os
 
 class AudioManager: NSObject, ObservableObject {
     static let shared = AudioManager()
@@ -21,12 +22,19 @@ class AudioManager: NSObject, ObservableObject {
     private var recognitionTask: SFSpeechRecognitionTask?
     private let audioEngine = AVAudioEngine()
     private let synthesizer = AVSpeechSynthesizer()
-    private let elevenLabsAPI = ElevenLabsAPI()
     private let backendAPI = BackendAPI()
     
     private var audioPlayer: AVAudioPlayer?
     private var cancellables = Set<AnyCancellable>()
     private var transcriptionBuffer: String = ""
+    
+    // MARK: - Signposting
+    private let audioLogger = Logger(subsystem: "com.brightspring.ComprehensionEngine", category: "Audio")
+    private lazy var signposter = OSSignposter(logger: audioLogger)
+    private var recordingSignpost: (id: OSSignpostID, state: OSSignpostIntervalState)?
+    private var ttsSignpost: (id: OSSignpostID, state: OSSignpostIntervalState)?
+    private var playbackSignpost: (id: OSSignpostID, state: OSSignpostIntervalState)?
+    private var streamSignpost: (id: OSSignpostID, state: OSSignpostIntervalState)?
     
     // MARK: - Streaming Playback (voice_chat)
     private let streamingQueue = DispatchQueue(label: "ce.audio.streaming.queue")
@@ -36,6 +44,10 @@ class AudioManager: NSObject, ObservableObject {
     private var streamingTask: URLSessionDataTask?
     private var pcmResidual: Data = Data()
     private var lastAppendAt: CFAbsoluteTime = CFAbsoluteTimeGetCurrent()
+    private var lastLevelUpdateAt: CFAbsoluteTime = 0
+    private let levelUpdateThrottle: CFTimeInterval = 1.0 / 20.0 // ~20 Hz throttle to reduce UI churn
+    private var lastPublishedLevel: Float = 0
+    private let minLevelDeltaToPublish: Float = 0.03 // only publish if level changes meaningfully
     
     // MARK: - Initialization
     private override init() {
@@ -103,6 +115,11 @@ class AudioManager: NSObject, ObservableObject {
         transcriptionText = ""
         // Do not clear transcriptionBuffer here; it is cleared when finalized
         isRecording = true
+        // Signpost: recording begin
+        let recId = signposter.makeSignpostID()
+        let recState = signposter.beginInterval("audio.recording", id: recId)
+        recordingSignpost = (recId, recState)
+        signposter.emitEvent("audio.recording_start")
         
         // Ensure any ongoing playback is stopped before reconfiguring the session
         if synthesizer.isSpeaking {
@@ -147,8 +164,15 @@ class AudioManager: NSObject, ObservableObject {
                         let rms = sqrt(sumOfSquares / Float(samplesCounted))
                         // Map RMS (~0..~0.1 typical speech) to 0..1 for UI
                         let normalized = min(max(rms * 20.0, 0.0), 1.0)
-                        DispatchQueue.main.async { [weak self] in
-                            self?.inputLevel = normalized
+                        let now = CFAbsoluteTimeGetCurrent()
+                        if let strongSelf = self,
+                           now - strongSelf.lastLevelUpdateAt >= strongSelf.levelUpdateThrottle,
+                           abs(normalized - strongSelf.lastPublishedLevel) >= strongSelf.minLevelDeltaToPublish {
+                            strongSelf.lastLevelUpdateAt = now
+                            strongSelf.lastPublishedLevel = normalized
+                            DispatchQueue.main.async { [weak self] in
+                                self?.inputLevel = normalized
+                            }
                         }
                     }
                 }
@@ -175,6 +199,8 @@ class AudioManager: NSObject, ObservableObject {
                 DispatchQueue.main.async {
                     self.isRecording = false
                 }
+                // Clean up recognition pipeline after completion or error
+                self.teardownRecognition()
             }
         }
     }
@@ -188,6 +214,18 @@ class AudioManager: NSObject, ObservableObject {
         audioEngine.stop()
         audioEngine.inputNode.removeTap(onBus: 0)
         recognitionRequest?.endAudio()
+        // Ensure recognition task/request do not linger
+        teardownRecognition()
+        // Settle waveform immediately
+        DispatchQueue.main.async { [weak self] in
+            self?.inputLevel = 0
+        }
+        // Signpost: recording end
+        signposter.emitEvent("audio.recording_stop")
+        if let rec = recordingSignpost {
+            signposter.endInterval("audio.recording", rec.state)
+            recordingSignpost = nil
+        }
     }
 
     // MARK: - Transcription Buffer Control
@@ -203,45 +241,36 @@ class AudioManager: NSObject, ObservableObject {
     }
     
     // MARK: - Speech Synthesis
+    /// Preferred path: fetch audio from backend `/api/tts` (which uses ElevenLabs server-side)
+    /// Falls back to system TTS if backend TTS fails or is unavailable.
     func speakWithElevenLabs(_ text: String, voiceId: String) async throws {
         guard !isSpeaking else { return }
         
-        await MainActor.run { self.isSpeaking = true }
+        // Signpost: TTS request lifecycle
+        let ttsId = signposter.makeSignpostID()
+        let ttsState = signposter.beginInterval("audio.tts_request", id: ttsId)
+        ttsSignpost = (ttsId, ttsState)
+        signposter.emitEvent("audio.tts_request_start")
+        defer {
+            signposter.endInterval("audio.tts_request", ttsState)
+            ttsSignpost = nil
+        }
         
         do {
-            // Prefer backend TTS if available
-            let audioData: Data
-            if !BackendAPI().baseURLStringIsEmpty {
-                // Try backend first
-                do {
-                    let _ttsStart = Date().timeIntervalSince1970
-                    print("⏱️ LATENCY [voice] tts_request_start: source=backend ts=\(_ttsStart)")
-                    audioData = try await backendAPI.textToSpeech(text: text, voiceId: voiceId)
-                    let _ttsEnd = Date().timeIntervalSince1970
-                    print("⏱️ LATENCY [voice] tts_request_end: source=backend ts=\(_ttsEnd) delta=\(_ttsEnd - _ttsStart)s size=\(audioData.count)B")
-                } catch {
-                    // Fallback to direct ElevenLabs
-                    print("⏱️ LATENCY [voice] tts_backend_failed_fallback: \(error.localizedDescription)")
-                    let _ttsStart = Date().timeIntervalSince1970
-                    print("⏱️ LATENCY [voice] tts_request_start: source=direct_elevenlabs ts=\(_ttsStart)")
-                    audioData = try await elevenLabsAPI.generateSpeech(text: text, voiceId: voiceId)
-                    let _ttsEnd = Date().timeIntervalSince1970
-                    print("⏱️ LATENCY [voice] tts_request_end: source=direct_elevenlabs ts=\(_ttsEnd) delta=\(_ttsEnd - _ttsStart)s size=\(audioData.count)B")
-                }
-            } else {
-                let _ttsStart = Date().timeIntervalSince1970
-                print("⏱️ LATENCY [voice] tts_request_start: source=direct_elevenlabs ts=\(_ttsStart)")
-                audioData = try await elevenLabsAPI.generateSpeech(text: text, voiceId: voiceId)
-                let _ttsEnd = Date().timeIntervalSince1970
-                print("⏱️ LATENCY [voice] tts_request_end: source=direct_elevenlabs ts=\(_ttsEnd) delta=\(_ttsEnd - _ttsStart)s size=\(audioData.count)B")
-            }
+            // Request audio from backend
+            let _ttsStart = Date().timeIntervalSince1970
+            print("⏱️ LATENCY [voice] tts_request_start: source=backend ts=\(_ttsStart)")
+            let audioData = try await backendAPI.textToSpeech(text: text, voiceId: voiceId)
+            let _ttsEnd = Date().timeIntervalSince1970
+            print("⏱️ LATENCY [voice] tts_request_end: source=backend ts=\(_ttsEnd) delta=\(_ttsEnd - _ttsStart)s size=\(audioData.count)B")
+            signposter.emitEvent("audio.tts_backend_success")
             try await playAudioData(audioData)
             await MainActor.run { self.isSpeaking = false }
         } catch {
-            print("ElevenLabs TTS failed: \(error)")
-            // Allow fallback to acquire speaking lock
-            await MainActor.run { self.isSpeaking = false }
+            print("Backend TTS failed: \(error.localizedDescription)")
+            signposter.emitEvent("audio.tts_backend_failed")
             // Fallback to system TTS
+            await MainActor.run { self.isSpeaking = false }
             speakWithSystem(text)
         }
     }
@@ -276,6 +305,15 @@ class AudioManager: NSObject, ObservableObject {
         }
     }
     
+    // MARK: - Recognition Cleanup
+    private func teardownRecognition() {
+        if let task = recognitionTask {
+            task.cancel()
+        }
+        recognitionTask = nil
+        recognitionRequest = nil
+    }
+    
     // MARK: - Audio Playback
     @MainActor
     private func playAudioData(_ audioData: Data) async throws {
@@ -289,6 +327,12 @@ class AudioManager: NSObject, ObservableObject {
         }
         print("🔊 DEBUG: Audio data size=\(audioData.count) bytes")
         
+        // Signpost: playback lifecycle
+        let pbId = signposter.makeSignpostID()
+        let pbState = signposter.beginInterval("audio.playback", id: pbId)
+        playbackSignpost = (pbId, pbState)
+        signposter.emitEvent("audio.playback_start")
+
         audioPlayer = try AVAudioPlayer(data: audioData)
         audioPlayer?.delegate = self
         // Ensure the player is ready and volume is audible
@@ -296,12 +340,17 @@ class AudioManager: NSObject, ObservableObject {
         audioPlayer?.volume = 1.0
         // ⏱️ LATENCY: eleven labs first starts speaking (at play start)
         print("⏱️ LATENCY [voice] tts_play_start: \(Date().timeIntervalSince1970)")
+        // Mark speaking precisely at play start so UI text aligns with first audio
+        self.isSpeaking = true
         audioPlayer?.play()
         
         // Wait for completion
         while audioPlayer?.isPlaying == true {
             try await Task.sleep(nanoseconds: 100_000_000) // 0.1 seconds
         }
+        signposter.emitEvent("audio.playback_end")
+        signposter.endInterval("audio.playback", pbState)
+        playbackSignpost = nil
     }
     
     // MARK: - Streaming voice_chat
@@ -323,6 +372,11 @@ class AudioManager: NSObject, ObservableObject {
         // Reset residuals
         pcmResidual.removeAll(keepingCapacity: true)
         lastAppendAt = CFAbsoluteTimeGetCurrent()
+        // Signpost: voice chat stream begin
+        let streamId = signposter.makeSignpostID()
+        let streamState = signposter.beginInterval("audio.voice_chat_stream", id: streamId)
+        streamSignpost = (streamId, streamState)
+        signposter.emitEvent("audio.voice_chat_stream_start")
         
         // Kick off HTTP streaming
         do {
@@ -342,6 +396,7 @@ class AudioManager: NSObject, ObservableObject {
                             player.play()
                         }
                         print("⏱️ LATENCY [voice] voice_chat_first_byte: \(Date().timeIntervalSince1970)")
+                        self.signposter.emitEvent("audio.voice_chat_first_byte")
                     }
                 },
                 onBytes: { [weak self] chunk in
@@ -356,15 +411,23 @@ class AudioManager: NSObject, ObservableObject {
                         self.flushResidualIfAny()
                         self.scheduleStopIfQuiescent(delay: 0.4)
                     }
+                    self.streamingTask = nil
+                    self.signposter.emitEvent("audio.voice_chat_stream_complete")
+                    if let sp = self.streamSignpost {
+                        self.signposter.endInterval("audio.voice_chat_stream", sp.state)
+                        self.streamSignpost = nil
+                    }
                 },
                 onError: { [weak self] error in
                     print("voice_chat stream error: \(error.localizedDescription)")
                     self?.cancelStreamingPlayback()
+                    self?.signposter.emitEvent("audio.voice_chat_stream_error")
                 }
             )
             streamingTask = task
         } catch {
             print("Failed to start voice_chat stream: \(error)")
+            signposter.emitEvent("audio.voice_chat_stream_failed_to_start")
         }
     }
     
@@ -375,14 +438,12 @@ class AudioManager: NSObject, ObservableObject {
         streamingQueue.sync {
             pcmResidual.removeAll(keepingCapacity: false)
         }
-        if let player = streamingPlayer {
-            if player.isPlaying { player.stop() }
-        }
-        if let engine = streamingEngine {
-            if engine.isRunning { engine.stop() }
-        }
-        DispatchQueue.main.async { [weak self] in
-            self?.isSpeaking = false
+        teardownStreaming()
+        // Signpost: end stream if active
+        if let sp = streamSignpost {
+            signposter.emitEvent("audio.voice_chat_stream_cancel")
+            signposter.endInterval("audio.voice_chat_stream", sp.state)
+            streamSignpost = nil
         }
     }
     
@@ -449,11 +510,7 @@ class AudioManager: NSObject, ObservableObject {
             guard let self = self else { return }
             let now = CFAbsoluteTimeGetCurrent()
             if now - self.lastAppendAt >= delay {
-                DispatchQueue.main.async {
-                    if let player = self.streamingPlayer, player.isPlaying { player.stop() }
-                    if let engine = self.streamingEngine, engine.isRunning { engine.stop() }
-                    self.isSpeaking = false
-                }
+                self.teardownStreaming()
             } else {
                 // Data arrived after scheduling; check again shortly
                 self.scheduleStopIfQuiescent(delay: delay)
@@ -472,6 +529,22 @@ class AudioManager: NSObject, ObservableObject {
         }
         DispatchQueue.main.async { [weak self] in
             self?.isSpeaking = false
+        }
+    }
+
+    // MARK: - Streaming teardown
+    private func teardownStreaming() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            if let player = self.streamingPlayer, player.isPlaying {
+                player.stop()
+            }
+            if let engine = self.streamingEngine, engine.isRunning {
+                engine.stop()
+            }
+            self.streamingPlayer = nil
+            self.streamingEngine = nil
+            self.isSpeaking = false
         }
     }
     
@@ -511,10 +584,12 @@ extension AudioManager: SFSpeechRecognizerDelegate {
 extension AudioManager: AVAudioPlayerDelegate {
     func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
         isSpeaking = false
+        audioPlayer = nil
     }
     
     func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
         isSpeaking = false
         print("Audio playback error: \(error?.localizedDescription ?? "Unknown error")")
+        audioPlayer = nil
     }
 }

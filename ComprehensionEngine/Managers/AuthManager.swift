@@ -15,6 +15,7 @@ class AuthManager: ObservableObject {
     @Published var user: UserProfile? = nil
     @Published var isLoading: Bool = false
     @Published var errorMessage: String? = nil
+    @Published var hasRestoredSession: Bool = false
 
     // MARK: - Token Storage (in-memory mirror of Keychain)
     fileprivate(set) var accessToken: String? = nil
@@ -30,9 +31,11 @@ class AuthManager: ObservableObject {
         if isAuthenticated {
             Task { [weak self] in
                 guard let self else { return }
-                await self.refreshTokensIfNeeded()
-                await self.fetchCurrentUser()
+                await self.validateAndRefreshSession()
+                await MainActor.run { self.hasRestoredSession = true }
             }
+        } else {
+            self.hasRestoredSession = true
         }
     }
 
@@ -50,7 +53,7 @@ class AuthManager: ObservableObject {
             let signInResult = try await GIDSignIn.sharedInstance.signIn(withPresenting: presentingViewController)
             let googleAccessToken = signInResult.user.accessToken.tokenString
             try await self.exchangeGoogleAccessToken(googleAccessToken)
-            try await self.fetchCurrentUser()
+            _ = await self.fetchCurrentUser()
             self.isAuthenticated = true
         } catch {
             self.errorMessage = "Google Sign-In failed: \(error.localizedDescription)"
@@ -70,15 +73,15 @@ class AuthManager: ObservableObject {
         user = nil
     }
 
-    func refreshTokensIfNeeded() async {
+    func refreshTokensIfNeeded() async -> Bool {
         // For now, always attempt a refresh if we have a refresh token
-        guard let refreshToken, !refreshToken.isEmpty else { return }
+        guard let refreshToken, !refreshToken.isEmpty else { return false }
         do {
             let pair = try await self.requestTokenRefresh(refreshToken: refreshToken)
             self.persistTokens(pair: pair)
+            return true
         } catch {
-            // If refresh fails, require re-authentication
-            self.logout()
+            return false
         }
     }
 
@@ -140,22 +143,23 @@ class AuthManager: ObservableObject {
         return try JSONDecoder().decode(TokenPair.self, from: respData)
     }
 
-    func fetchCurrentUser() async {
+    func fetchCurrentUser() async -> Bool {
         guard let base = BackendAPI.resolveBaseURLString(), let url = URL(string: base.trimmedTrailingSlash() + "/api/auth/me") else {
-            return
+            return false
         }
-        guard let token = accessToken else { return }
+        guard let token = accessToken else { return false }
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
-            guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else { return }
+            guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else { return false }
             let profile = try JSONDecoder().decode(UserProfile.self, from: data)
             self.user = profile
+            return true
         } catch {
-            // Non-fatal
+            return false
         }
     }
 
@@ -182,6 +186,21 @@ class AuthManager: ObservableObject {
         KeychainHelper.shared.save(key: keychainAccessTokenKey, value: pair.access_token)
         KeychainHelper.shared.save(key: keychainRefreshTokenKey, value: pair.refresh_token)
         self.isAuthenticated = true
+    }
+
+    private func validateAndRefreshSession() async {
+        let refreshed = await self.refreshTokensIfNeeded()
+        if refreshed {
+            _ = await self.fetchCurrentUser()
+            return
+        }
+
+        let userValid = await self.fetchCurrentUser()
+        if !userValid {
+            await MainActor.run {
+                self.logout()
+            }
+        }
     }
 }
 

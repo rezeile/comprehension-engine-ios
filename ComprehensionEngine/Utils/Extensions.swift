@@ -72,7 +72,7 @@ extension String {
 // MARK: - Bundle Extensions
 extension Bundle {
     var appName: String {
-        return infoDictionary?["CFBundleName"] as? String ?? "Graspy"
+        return infoDictionary?["CFBundleName"] as? String ?? "GraspWell"
     }
     
     var appVersion: String {

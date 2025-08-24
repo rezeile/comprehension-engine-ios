@@ -28,14 +28,15 @@ struct LoginView: View {
 
                 // Center content
                 VStack(spacing: 16) {
-                    Text("Learn Faster, Deeper")
+                    Text("Understand Faster. Remember Longer.")
                         .displayHero(color: .white)
+                        .font(.system(size: 20, weight: .bold, design: .default))
                         .multilineTextAlignment(.center)
-                        .minimumScaleFactor(0.8)
 
-                    Text("Your AI learning companion that helps you understand anything.")
+                    Text("Your AI tutor that adapts as you think.")
                         .bodyLarge(color: .white)
                         .multilineTextAlignment(.center)
+                        .font(.system(size: 12, weight: .regular, design: .default))
                         .accessibilityHint("Introductory description")
                 }
                 .padding(.horizontal, 24)

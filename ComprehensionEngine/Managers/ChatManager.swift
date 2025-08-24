@@ -1,20 +1,43 @@
 import Foundation
 import Combine
 import UIKit
+import os
 
 class ChatManager: ObservableObject {
     static let shared = ChatManager()
     
     // MARK: - Published Properties
-    @Published var messages: [ChatMessage] = []
+    // Phase A: Use a single visible window for UI to reduce memory
+    @Published var visibleMessages: [ChatMessage] = []
     @Published var isLoading = false
     @Published var currentSession: ChatSession = ChatSession()
     @Published var sessions: [ChatSession] = []
-    @Published var selectedModel: AIModel = .claudeSonnet35
     
     // MARK: - Private Properties
     private let chatAPI = BackendAPI()
     private var cancellables = Set<AnyCancellable>()
+
+    // MARK: - Performance Controls (Phase A)
+    private let boundedHistoryEnabled: Bool = true
+    private let windowCap: Int = 100 // total ChatMessage items retained for UI window
+    // In-memory caps for the active session (device-aware)
+    private let messageCountCapPhone: Int = 100
+    private let messageCountCapPad: Int = 180
+    private let charCapPhone: Int = 300_000 // ~300k characters
+    private let charCapPad: Int = 400_000   // ~400k characters on iPad
+
+    private var currentMessageCountCap: Int {
+        return UIDevice.current.userInterfaceIdiom == .pad ? messageCountCapPad : messageCountCapPhone
+    }
+    private var currentCharCap: Int {
+        return UIDevice.current.userInterfaceIdiom == .pad ? charCapPad : charCapPhone
+    }
+
+    // MARK: - Telemetry (Phase B)
+    private let telemetryEnabled: Bool = true
+    private var metrics = ChatHistoryMetrics()
+    private let chatLogger = Logger(subsystem: "com.brightspring.ComprehensionEngine", category: "ChatHistory")
+    private lazy var signposter = OSSignposter(logger: chatLogger)
     
     // MARK: - Initialization
     private init() {
@@ -48,9 +71,15 @@ class ChatManager: ObservableObject {
         await MainActor.run {
             print("🔍 DEBUG: Inside MainActor.run - adding user message")
             self.currentSession.messages.append(userMessage)
-            self.messages.append(userMessage)
+            if self.boundedHistoryEnabled {
+                self.appendToVisible(userMessage)
+            } else {
+                self.visibleMessages.append(userMessage)
+            }
             self.isLoading = true
             print("🔍 DEBUG: User message added successfully")
+            // Enforce in-memory caps after append
+            self.enforceSessionCaps()
         }
         
         // DEBUG BREAKPOINT 3: Before API call
@@ -64,7 +93,12 @@ class ChatManager: ObservableObject {
         
         do {
             print("🔍 DEBUG: About to call Backend API")
-            let response = try await chatAPI.sendMessage(message: content, history: historyExcludingPending)
+            let response = try await chatAPI.sendMessage(
+                message: content,
+                history: historyExcludingPending,
+                conversationId: currentSession.remoteId,
+                mode: "voice"
+            )
             print("🔍 DEBUG: API response received: \(response.content)")
             // ⏱️ LATENCY: message received from Claude/backend
             let _latencyClaudeRecvTs = Date().timeIntervalSince1970
@@ -79,15 +113,24 @@ class ChatManager: ObservableObject {
             await MainActor.run {
                 print("🔍 DEBUG: Inside MainActor.run - adding assistant message")
                 self.currentSession.messages.append(assistantMessage)
-                self.messages.append(assistantMessage)
+                if self.boundedHistoryEnabled {
+                    self.appendToVisible(assistantMessage)
+                } else {
+                    self.visibleMessages.append(assistantMessage)
+                }
                 self.isLoading = false
                 
-                // Update session timestamp
+                // Update session timestamp and adopt remote conversation id if provided
                 self.currentSession.updatedAt = Date()
+                if let cid = response.conversationId, !cid.isEmpty {
+                    self.currentSession.remoteId = cid
+                }
                 
                 // Save sessions
                 self.saveSessions()
                 print("🔍 DEBUG: Assistant message added and sessions saved")
+                // Enforce in-memory caps after append
+                self.enforceSessionCaps()
             }
             
             return assistantMessage
@@ -101,6 +144,12 @@ class ChatManager: ObservableObject {
         }
     }
     
+    // Expose a public refresh to update sessions from backend on demand
+    @MainActor
+    func refreshSessions() async {
+        await refreshSessionsFromBackend()
+    }
+    
     func createNewSession() {
         // Save current session if it has messages
         if !currentSession.messages.isEmpty {
@@ -110,12 +159,17 @@ class ChatManager: ObservableObject {
         
         // Create new session
         currentSession = ChatSession()
-        messages = []
+        visibleMessages = []
     }
     
     func loadSession(_ session: ChatSession) {
         currentSession = session
-        messages = session.messages
+        // Build a visible window (tail) for UI
+        if boundedHistoryEnabled {
+            rebuildVisibleWindowFromTail()
+        } else {
+            visibleMessages = session.messages
+        }
 
         // If this session originated from the backend, fetch full history
         if let remoteId = session.remoteId, !remoteId.isEmpty {
@@ -135,7 +189,7 @@ class ChatManager: ObservableObject {
     
     func clearCurrentSession() {
         currentSession.messages.removeAll()
-        messages.removeAll()
+        visibleMessages.removeAll()
         saveSessions()
     }
     
@@ -218,16 +272,54 @@ class ChatManager: ObservableObject {
     @MainActor
     private func loadFullSessionFromBackend(remoteId: String) async {
         do {
-            // Fetch up to 500 turns in order; paginate later if needed
-            let turns = try await chatAPI.listConversationTurns(conversationId: remoteId, limit: 500, offset: 0)
+            // Phase A/B: Limit turns fetched to the latest window
+            // Try to infer a sane offset by first fetching conversation summaries (if available)
+            let desiredTurns = max(1, windowCap / 2) // ~2 ChatMessage per turn
+            var turns: [ConversationTurnDTO] = []
+            if let summaries = try? await chatAPI.listConversations(limit: 200, offset: 0),
+               let summary = summaries.first(where: { $0.id == remoteId }),
+               let total = summary.turn_count, total > 0 {
+                let startOffset = max(0, total - desiredTurns)
+                turns = try await chatAPI.listConversationTurns(conversationId: remoteId, limit: desiredTurns, offset: startOffset)
+            } else {
+                // Fallback: step through pages until we find the last (bounded by a safety cap)
+                let pageSize = desiredTurns
+                var offset = 0
+                var lastPage: [ConversationTurnDTO] = []
+                var safetyCounter = 0
+                while true {
+                    let page = try await chatAPI.listConversationTurns(conversationId: remoteId, limit: pageSize, offset: offset)
+                    safetyCounter &+= 1
+                    if page.isEmpty { break }
+                    lastPage = page
+                    if page.count < pageSize { break } // reached the last page
+                    offset &+= pageSize
+                    if safetyCounter > 50 { break } // safety cap to avoid unbounded loops
+                }
+                turns = lastPage
+            }
+            if telemetryEnabled {
+                metrics.pageFetches &+= 1
+                metrics.lastFetchedPageSize = turns.count
+                metrics.totalFetchedMessages &+= (turns.count * 2)
+                signposter.emitEvent("chat.page_fetch")
+            }
             var rebuilt: [ChatMessage] = []
             rebuilt.reserveCapacity(turns.count * 2)
             for t in turns {
                 rebuilt.append(ChatMessage(content: t.user_input, role: .user, isFromUser: true))
                 rebuilt.append(ChatMessage(content: t.ai_response, role: .assistant, isFromUser: false))
             }
-            self.currentSession.messages = rebuilt
-            self.messages = rebuilt
+            // Replace preview-only history with fetched window if larger
+            if self.currentSession.messages.isEmpty || rebuilt.count >= self.currentSession.messages.count {
+                self.currentSession.messages = rebuilt
+            }
+            // Refresh the visible window from tail
+            if self.boundedHistoryEnabled {
+                self.rebuildVisibleWindowFromTail()
+            } else {
+                self.visibleMessages = self.currentSession.messages
+            }
         } catch {
             // Non-fatal: keep whatever we had (preview or empty)
         }
@@ -254,5 +346,132 @@ extension ChatManager {
                 return "Invalid response from server"
             }
         }
+    }
+}
+
+// MARK: - Phase A Helpers (Bounded UI Window)
+private extension ChatManager {
+    /// Trim the active session's messages to respect device-aware count and character caps.
+    /// Oldest messages are evicted first. Rebuilds the visible window from the tail afterward.
+    @MainActor
+    func enforceSessionCaps() {
+        var totalChars: Int = 0
+        // Compute once to avoid repeated O(n) sums in loop
+        for msg in currentSession.messages { totalChars &+= msg.content.count }
+
+        let countCap = currentMessageCountCap
+        let charCap = currentCharCap
+        var didTrim = false
+
+        while (!currentSession.messages.isEmpty) &&
+                (currentSession.messages.count > countCap || totalChars > charCap) {
+            let removed = currentSession.messages.removeFirst()
+            totalChars &-= removed.content.count
+            didTrim = true
+        }
+
+        if boundedHistoryEnabled {
+            rebuildVisibleWindowFromTail()
+        } else {
+            visibleMessages = currentSession.messages
+        }
+
+        if didTrim {
+            saveSessions()
+        }
+    }
+    func appendToVisible(_ message: ChatMessage) {
+        visibleMessages.append(message)
+        if telemetryEnabled {
+            metrics.messagesAppended &+= 1
+        }
+        enforceCapIfNeeded()
+    }
+    func rebuildVisibleWindowFromTail() {
+        if currentSession.messages.count <= windowCap {
+            visibleMessages = currentSession.messages
+        } else {
+            visibleMessages = Array(currentSession.messages.suffix(windowCap))
+        }
+        if telemetryEnabled {
+            metrics.windowCurrentCount = visibleMessages.count
+            if metrics.windowCurrentCount > metrics.windowPeakCount {
+                metrics.windowPeakCount = metrics.windowCurrentCount
+            }
+        }
+    }
+    func enforceCapIfNeeded() {
+        guard boundedHistoryEnabled, visibleMessages.count > windowCap else { return }
+        let overflow = visibleMessages.count - windowCap
+        if overflow > 0 {
+            if telemetryEnabled {
+                metrics.evictionsCount &+= 1
+                metrics.totalEvictedMessages &+= overflow
+                signposter.emitEvent("chat.window_evict")
+            }
+            visibleMessages.removeFirst(overflow)
+        }
+        if telemetryEnabled {
+            metrics.windowCurrentCount = visibleMessages.count
+            if metrics.windowCurrentCount > metrics.windowPeakCount {
+                metrics.windowPeakCount = metrics.windowCurrentCount
+            }
+        }
+    }
+}
+
+// MARK: - Telemetry Models & Snapshot (Phase B)
+private struct ChatHistoryMetrics {
+    var windowPeakCount: Int = 0
+    var windowCurrentCount: Int = 0
+    var messagesAppended: Int = 0
+    var evictionsCount: Int = 0
+    var totalEvictedMessages: Int = 0
+    var pageFetches: Int = 0
+    var lastFetchedPageSize: Int = 0
+    var totalFetchedMessages: Int = 0
+}
+
+struct ChatHistoryMetricsSnapshot: Codable, Equatable {
+    let windowPeakCount: Int
+    let windowCurrentCount: Int
+    let messagesAppended: Int
+    let evictionsCount: Int
+    let totalEvictedMessages: Int
+    let pageFetches: Int
+    let lastFetchedPageSize: Int
+    let totalFetchedMessages: Int
+}
+
+extension ChatManager {
+    @MainActor
+    func metricsSnapshot() -> ChatHistoryMetricsSnapshot {
+        return ChatHistoryMetricsSnapshot(
+            windowPeakCount: metrics.windowPeakCount,
+            windowCurrentCount: metrics.windowCurrentCount,
+            messagesAppended: metrics.messagesAppended,
+            evictionsCount: metrics.evictionsCount,
+            totalEvictedMessages: metrics.totalEvictedMessages,
+            pageFetches: metrics.pageFetches,
+            lastFetchedPageSize: metrics.lastFetchedPageSize,
+            totalFetchedMessages: metrics.totalFetchedMessages
+        )
+    }
+
+    /// Appends a local user message (e.g., finalized voice transcript on exit) without sending to backend.
+    @MainActor
+    func appendLocalUserMessage(_ content: String) {
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let localMessage = ChatMessage(content: trimmed, role: .user, isFromUser: true)
+        currentSession.messages.append(localMessage)
+        if boundedHistoryEnabled {
+            appendToVisible(localMessage)
+        } else {
+            visibleMessages.append(localMessage)
+        }
+        currentSession.updatedAt = Date()
+        enforceSessionCaps()
+        saveSessions()
     }
 }

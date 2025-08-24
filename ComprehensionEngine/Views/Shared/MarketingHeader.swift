@@ -12,10 +12,10 @@ struct MarketingHeader: View {
                 .shadow(color: AppColors.shadowDark, radius: 12, x: 0, y: 6)
                 .accessibilityHidden(true)
 
-            Text("Graspy")
+            Text("GraspWell")
                 .heading2(color: .white)
                 .font(.system(size: 96, weight: .bold))
-                .accessibilityLabel("Graspy, home header")
+                .accessibilityLabel("GraspWell, home header")
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 20)

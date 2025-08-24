@@ -11,6 +11,11 @@ struct VoiceModeView: View {
     @State private var errorMessage = ""
     @AppStorage("feature_waveform_enabled") private var featureWaveformEnabled: Bool = true
     @AppStorage("voice_auto_resume_after_reply") private var voiceAutoResumeAfterReply: Bool = true
+    #if DEBUG
+    @AppStorage("use_voice_chat_stream") private var useVoiceChatStream: Bool = true
+    #else
+    @AppStorage("use_voice_chat_stream") private var useVoiceChatStream: Bool = false
+    #endif
     @State private var isSending: Bool = false
     
     // MARK: - Signposting
